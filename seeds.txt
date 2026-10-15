@@ -1,0 +1,14 @@
+# Comptes sources : le script suit les abonnes les plus recents de ces comptes.
+# Un pseudo par ligne, avec ou sans @. Tout ce qui suit # est ignore.
+#
+# Pour maximiser le follow-back :
+#  - des comptes de TA niche (meme theme que tes videos) : leurs abonnes aiment deja ce que tu postes ;
+#  - des createurs moyens (10 k a 500 k abonnes) qui publient souvent : leurs nouveaux abonnes sont actifs ;
+#  - pas de stars a plusieurs millions d'abonnes : beaucoup de comptes passifs ou inactifs ;
+#  - au moins 10 sources : le script mesure le rendement de chacune et privilegie les meilleures
+#    ('tiktok_rotate.py status' affiche le classement). Remplace celles qui restent en bas apres 2-3 semaines.
+#  - la liste d'abonnes doit etre publique (sinon la source est ignoree apres 3 echecs).
+#
+# Exemples (a remplacer par tes sources, sans le # devant) :
+# createur_de_ta_niche
+# @autre_createur

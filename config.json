@@ -1,0 +1,13 @@
+{
+  "username": "",
+  "follows_per_day": 80,
+  "unfollow_after_days": 4,
+  "keep_followbacks": false,
+  "seed_scoring": true,
+  "max_follows_per_hour": 20,
+  "max_unfollows_per_hour": 25,
+  "active_hours": [8, 23],
+  "daily_minutes": 180,
+  "virtual_desktop": 2,
+  "browser_channel": "msedge"
+}
