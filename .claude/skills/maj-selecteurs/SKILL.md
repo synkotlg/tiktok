@@ -28,7 +28,7 @@ Ne jamais lancer le script soi-meme contre le vrai TikTok.
 | pseudo detecte | `NAV_PROFILE_SEL` |
 | titre (USER_TITLE_SEL) = 0 | `USER_TITLE_SEL` (sert aussi a trouver le bouton du profil) |
 | compteur d'abonnes = 0 | `FOLLOWERS_COUNT_SEL`, `FOLLOWERS_LABEL_SEL` |
-| bouton du profil None ou mauvais etat | `JS_PROFILE_BTN`, `NOT_FOLLOWING_RE`, `FOLLOWING_RE` |
+| bouton du profil None ou mauvais etat | `JS_PROFILE_BTN`, `NOT_FOLLOWING_RE`, `FOLLOWING_RE`, `FRIENDS_RE` |
 | liste d'abonnes `hidden` alors qu'elle s'affiche | `DIALOG_SEL`, `ROW_LINK_SEL`, `FOLLOWERS_TAB_RE` |
 | comptes dans la liste = 0 | `ROW_LINK_SEL`, regex des liens dans `JS_USERS` et `JS_HREF_USERS` |
 | textes des boutons de la liste | comparer a `FOLLOW_RE`, `FOLLOW_BACK_RE`, `FOLLOWING_RE` |
@@ -37,6 +37,12 @@ Ne jamais lancer le script soi-meme contre le vrai TikTok.
 
 La ligne "data-e2e de la page" liste les attributs `data-e2e` presents : les preferer aux classes CSS
 (generees, elles changent a chaque deploiement de TikTok).
+
+Journal "Reponse de TikTok aux abonnements introuvable (FOLLOW_API_RE)" : l'adresse de la requete
+d'abonnement a change. Le script marche encore (controle par le bouton), mais sans le signal le plus fiable.
+Demander a l'utilisateur, dans la fenetre du bot (F12, onglet Reseau, filtre "follow"), l'adresse de la
+requete envoyee quand il s'abonne a la main, et sa reponse ; adapter `FOLLOW_API_RE` et le format lu par
+`api_reply`, puis la maquette (`/api/commit/follow/user/` dans `tests/mock_tiktok.py`).
 
 ## 3. Modifier
 

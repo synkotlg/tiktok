@@ -49,6 +49,7 @@ NOT_FOLLOWING_RE = re.compile(r"^(Suivre|Follow)( en retour| back)?$", re.I)
 FOLLOWING_RE = re.compile(
     r"^(Abonné\(e\)|Abonnée?|Suivi\(e\)|Suivie?|Following|Ami\(e\)s|Amis|Friends|"
     r"Demande envoyée|Demandé|Requested)", re.I)
+FRIENDS_RE = re.compile(r"^(Ami\(e\)s|Amis|Friends)", re.I)  # abonnement mutuel : il te suit aussi
 UNFOLLOW_RE = re.compile(r"^(Ne plus suivre|Se désabonner|Unfollow|Annuler la demande|Cancel request)$", re.I)
 LATER_RE = re.compile(r"^(Plus tard|Pas maintenant|Not now|Peut-être plus tard|Maybe later)$", re.I)
 COOKIES_RE = re.compile(r"^(Refuser les cookies optionnels|Decline optional cookies)$", re.I)
@@ -70,6 +71,9 @@ ATTENTION_RE = re.compile(  # compte banni, suspendu, deconnecte
     r"Votre compte a été (banni|suspendu|désactivé)|Your account (was|has been) "
     r"(permanently )?(banned|suspended|disabled)", re.I)
 ATTENTION_URL_RE = re.compile(r"tiktok\.com/(login|signup)")
+# Requete envoyee par la page a chaque (des)abonnement. Sa reponse JSON dit si TikTok a vraiment pris
+# l'action en compte : status_code 0 = accepte, sinon refus (status_msg = raison). Lecture seule.
+FOLLOW_API_RE = re.compile(r"/api/commit/follow/user/")
 NOT_FOUND_RE = re.compile(
     r"Impossible de trouver ce compte|Couldn.t find this account|Ce compte est introuvable|"
     r"Ce compte a été banni|This account was banned|Page non disponible|Page not available", re.I)
@@ -171,6 +175,9 @@ DEFAULTS = {
     # prudence : montee en charge, plafonds, plage horaire, repos, reaction aux blocages
     "ramp_start": 15,
     "ramp_step": 10,
+    # seuls les jours d'abonnement de cette fenetre comptent : apres une longue absence, montee en charge
+    # reprise depuis ramp_start (repartir d'un coup a plein regime est un signal classique)
+    "ramp_window_days": 14,
     "max_follows_per_hour": 20,
     "max_unfollows_per_hour": 25,
     "max_unfollows_per_day": 100,
@@ -311,6 +318,9 @@ class State:
         row = self.db.execute("SELECT followed_at FROM users WHERE username=?", (user,)).fetchone()
         return row[0] if row else ""
 
+    def followed_back(self, user):
+        return self.count("username=? AND followed_back_on IS NOT NULL", (user,)) > 0
+
     def mark_followed_back(self, user):
         self.db.execute("UPDATE users SET followed_back_on=? WHERE username=? AND followed_back_on IS NULL",
                         (today().isoformat(), user))
@@ -326,10 +336,12 @@ class State:
         """Abonnements en cours faits par le script (hors follow-back gardes si keep_followbacks)."""
         return self.count("unfollowed_on IS NULL" + (" AND followed_back_on IS NULL" if keep_followbacks else ""))
 
-    def active_follow_days(self):
-        """Jours (avant aujourd'hui) ou des abonnements ont ete faits : sert a la montee en charge."""
-        return self.db.execute("SELECT COUNT(DISTINCT followed_on) FROM users WHERE followed_on < ?",
-                               (today().isoformat(),)).fetchone()[0]
+    def active_follow_days(self, window_days):
+        """Jours des `window_days` derniers (avant aujourd'hui) ou des abonnements ont ete faits : sert a la
+        montee en charge."""
+        return self.db.execute(
+            "SELECT COUNT(DISTINCT followed_on) FROM users WHERE followed_on < ? AND followed_on >= ?",
+            (today().isoformat(), (today() - timedelta(days=window_days)).isoformat())).fetchone()[0]
 
     def actions_since(self, kind, since):
         """Horodatages (ISO) des abonnements ('follow') ou desabonnements ('unfollow') depuis `since`."""
@@ -574,7 +586,7 @@ def in_active_hours(cfg, moment):
 
 def follow_budget(st, cfg):
     """Abonnements autorises aujourd'hui : montee en charge progressive, reduite apres un blocage."""
-    ramp = cfg["ramp_start"] + cfg["ramp_step"] * st.active_follow_days()
+    ramp = cfg["ramp_start"] + cfg["ramp_step"] * st.active_follow_days(cfg["ramp_window_days"])
     factor = float(st.get_meta("quota_factor") or 1.0)
     return max(0, int(min(cfg["follows_per_day"], ramp) * factor))
 
@@ -841,7 +853,9 @@ def wait_captcha(page, cfg):
     while time.monotonic() < end:
         page.wait_for_timeout(5000)
         if not captcha_visible(page):
-            log.info("Captcha resolu : reprise")
+            # signe de soupcon de TikTok : on ne repart pas au meme rythme
+            cfg["_slow"] = min(3.0, cfg.get("_slow", 1.0) * 1.5)
+            log.info("Captcha resolu : reprise, pauses x %.1f jusqu'a la fin du passage", cfg["_slow"])
             page.wait_for_timeout(rnd(2000, 4000))
             return True
     return False
@@ -855,6 +869,62 @@ def blocked(page, cfg):
     if kind:
         cfg["_block"] = kind
     return kind is not None
+
+
+def watch_api(page, cfg):
+    """Garde les reponses de TikTok aux (des)abonnements de la page (lecture seule, rien n'est modifie)."""
+    cfg["_api"], cfg["_api_misses"] = [], 0
+    page.on("response", lambda r: cfg["_api"].append(r) if FOLLOW_API_RE.search(r.url) else None)
+
+
+def api_clear(cfg):
+    if "_api" in cfg:
+        cfg["_api"] = []
+
+
+def api_reply(page, cfg):
+    """(status_code, status_msg) de la reponse de TikTok a la derniere action, ou None si aucune reponse
+    lisible : on se fie alors au bouton seul. Attente de 3 s au plus, sauf si l'API semble introuvable."""
+    if "_api" not in cfg:
+        return None
+    if cfg["_api_misses"] < 3:
+        for _ in range(12):  # 3 s au plus
+            if cfg["_api"]:
+                break
+            page.wait_for_timeout(250)
+    responses, cfg["_api"] = cfg["_api"], []
+    for r in reversed(responses):
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        if isinstance(data, dict) and "status_code" in data:
+            cfg["_api_misses"] = 0
+            return int(data["status_code"] or 0), str(data.get("status_msg") or "")
+    return None
+
+
+def api_missing(cfg):
+    """Action confirmee par le bouton sans reponse de l'API vue (un clic ignore n'envoie rien, il ne compte
+    pas) : apres 3 de suite, l'adresse a sans doute change et on n'attend plus la reponse."""
+    if "_api" not in cfg:
+        return
+    cfg["_api_misses"] += 1
+    if cfg["_api_misses"] == 3:
+        log.warning("Reponse de TikTok aux abonnements introuvable (FOLLOW_API_RE) : controle par le bouton "
+                    "seulement ; voir la skill maj-selecteurs")
+
+
+def api_reaction(reply):
+    """None si TikTok a accepte l'action (ou si sa reponse n'a pas ete vue) ; sinon 'warning' ou 'limit' quand
+    le message est reconnu, 'refused' pour un refus sans message connu."""
+    if not reply or reply[0] == 0:
+        return None
+    if WARN_RE.search(reply[1]):
+        return "warning"
+    if BLOCK_RE.search(reply[1]):
+        return "limit"
+    return "refused"
 
 
 def prune(folder, pattern, keep):
@@ -898,7 +968,7 @@ def logged_in(page):
 
 def human_pause(page, cfg, n, kind):
     """Pause entre deux actions : etalee sur l'heure (3600 s / plafond horaire), avec variation."""
-    secs = 3600 / cfg[f"max_{kind}s_per_hour"] * rnd(*cfg["pause_jitter"])
+    secs = 3600 / cfg[f"max_{kind}s_per_hour"] * rnd(*cfg["pause_jitter"]) * cfg.get("_slow", 1.0)
     if n % cfg["long_pause_every"] == 0:
         secs += rnd(*cfg["long_pause_seconds"])
     deadline = cfg.get("_deadline")
@@ -921,13 +991,16 @@ def open_profile(page, user):
 
 
 def profile_state(page):
-    """'follow' (pas abonne), 'following' (abonne, ami ou demande envoyee) ou None (bouton introuvable).
+    """Pas abonne : 'follow', ou 'fan' s'il te suit ("Suivre en retour"). Abonne : 'friends' s'il te suit
+    aussi ("Amis"), sinon 'following' (abonne ou demande envoyee). None : bouton introuvable.
     Le bouton trouve est marque : page.locator(PROFILE_BTN_SEL)."""
     pattern = f"(?:{NOT_FOLLOWING_RE.pattern})|(?:{FOLLOWING_RE.pattern})"
     text = page.evaluate(JS_PROFILE_BTN, {"title": USER_TITLE_SEL, "re": pattern})
     if text is None:
         return None
-    return "follow" if NOT_FOLLOWING_RE.match(text) else "following"
+    if NOT_FOLLOWING_RE.match(text):
+        return "fan" if FOLLOW_BACK_RE.match(text) else "follow"
+    return "friends" if FRIENDS_RE.match(text) else "following"
 
 
 def open_followers(page, user, cfg, load=True):
@@ -1030,6 +1103,7 @@ def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: Non
                 continue
             if not throttle(page, st, cfg, "follow"):
                 return done, "stop"
+            api_clear(cfg)
             try:
                 btns.nth(idx).click(timeout=8000)
             except PWTimeout:
@@ -1039,16 +1113,28 @@ def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: Non
             if blocked(page, cfg):
                 shot(page, cfg, "blocked-follow")
                 return done, "blocked"
-            if not follow_registered(page, dlg, user):
-                # le bouton est reste ou revenu sur "Suivre" : TikTok a ignore le clic (limitation silencieuse)
+            reply = api_reply(page, cfg)
+            reaction = api_reaction(reply)
+            if reaction in ("warning", "limit"):
+                log.warning("[%s] TikTok refuse l'abonnement a @%s : %s", seed, user, reply[1])
+                cfg["_block"] = reaction
+                shot(page, cfg, "blocked-follow")
+                return done, "blocked"
+            if reaction == "refused" or not follow_registered(page, dlg, user):
+                # refus de TikTok (meme si le bouton affiche Abonne), ou bouton reste ou revenu sur "Suivre" :
+                # TikTok a ignore le clic (limitation silencieuse)
                 fails += 1
                 skip.add(user)
-                log.info("[%s] abonnement a @%s non pris en compte (%d de suite)", seed, user, fails)
+                log.info("[%s] abonnement a @%s non pris en compte%s (%d de suite)", seed, user,
+                         f" (refus de TikTok, code {reply[0]})" if reaction else "", fails)
                 shot(page, cfg, f"follow-{user}")
                 if fails >= 3:
                     cfg["_block"] = "limit"
                     return done, "blocked"
+                human_pause(page, cfg, counter[0], "follow")  # le clic a eu lieu : pas de nouvel essai en rafale
                 continue
+            if reply is None:
+                api_missing(cfg)
             fails = 0
             st.add_follow(user, seed, fixed_days())
             done += 1
@@ -1088,7 +1174,7 @@ def follow_sticks(page, user, cfg):
         if visible(tab.get_by_text(NOT_FOUND_RE)):
             return None
         state = profile_state(tab)
-        return None if state is None else ("ok" if state == "following" else "lost")
+        return None if state is None else ("ok" if state in ("following", "friends") else "lost")
     except Exception:  # sondage facultatif : une erreur de navigation ne doit pas arreter le passage
         return None
     finally:
@@ -1210,19 +1296,26 @@ def scan_my_followers(page, me, st, cfg):
 # ---------------------------------------------------------------------------
 # Desabonnements
 # ---------------------------------------------------------------------------
-def unfollow_one(page, user, cfg):
-    """Retourne 'ok' | 'gone' | 'already' | 'failed' | 'blocked' ; 'already' = deja plus abonne."""
+def unfollow_one(page, user, st, cfg, spare_friends=False):
+    """Retourne 'ok' | 'gone' | 'already' | 'friend' | 'refused' | 'failed' | 'blocked'.
+    'already' = deja plus abonne ; 'friend' = il te suit (vu sur son profil, note comme follow-back) et
+    spare_friends : rien n'est clique. 'refused' = TikTok a refuse le desabonnement."""
     open_profile(page, user)
     if blocked(page, cfg):
         return "blocked"
     if visible(page.get_by_text(NOT_FOUND_RE)):
         return "gone"
     state = profile_state(page)
-    if state == "follow":
+    if state in ("fan", "friends"):  # follow-back que la lecture de tes abonnes n'a pas vu
+        st.mark_followed_back(user)
+    if state in ("follow", "fan"):
         return "already"
+    if state == "friends" and spare_friends:
+        return "friend"
     if state is None:
         shot(page, cfg, f"unfollow-{user}-nobutton")
         return "failed"
+    api_clear(cfg)
     try:
         page.locator(PROFILE_BTN_SEL).first.click(timeout=8000)
     except PWTimeout:
@@ -1240,8 +1333,20 @@ def unfollow_one(page, user, cfg):
         page.wait_for_timeout(rnd(1200, 2000))
     if blocked(page, cfg):
         return "blocked"
+    reply = api_reply(page, cfg)
+    reaction = api_reaction(reply)
+    if reaction in ("warning", "limit"):
+        log.warning("TikTok refuse le desabonnement de @%s : %s", user, reply[1])
+        cfg["_block"] = reaction
+        return "blocked"
+    if reaction == "refused":
+        log.info("TikTok refuse le desabonnement de @%s (code %d)", user, reply[0])
+        shot(page, cfg, f"unfollow-{user}-refused")
+        return "refused"
     for _ in range(4):
-        if profile_state(page) == "follow":
+        if profile_state(page) in ("follow", "fan"):
+            if reply is None:
+                api_missing(cfg)
             return "ok"
         page.wait_for_timeout(1500)
     shot(page, cfg, f"unfollow-{user}")
@@ -1254,21 +1359,34 @@ def unfollow_pass(page, st, cfg, counter, days, until=None):
     due = st.due(days, max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today()), cfg["keep_followbacks"],
                  cfg["followback_keep_days"])
     log.info("%d compte(s) a desabonner", len(due))
-    done = fails = phantoms = 0
+    done = fails = phantoms = refused = 0
     since = st.get_meta("last_block_at") or ""  # les abonnements d'avant ont deja valu un blocage
+    spare = cfg["keep_followbacks"] or cfg["followback_keep_days"] > 0
     for user in due:
         if until and now() >= until:
             log.info("Part du temps reservee aux desabonnements utilisee : place aux abonnements")
             return done, "later"
         if not throttle(page, st, cfg, "unfollow"):
             return done, "stop"
-        res = unfollow_one(page, user, cfg)
+        # un follow-back deja connu n'arrive ici qu'une fois sa periode de grace passee
+        res = unfollow_one(page, user, st, cfg, spare_friends=spare and not st.followed_back(user))
         if res == "blocked":
             return done, "blocked"
+        if res == "friend":
+            log.info("@%s te suit en retour (absent de la lecture de tes abonnes) : garde", user)
+            continue
+        if res == "refused":
+            refused += 1
+            if refused >= 3:
+                log.warning("3 desabonnements de suite refuses par TikTok : limitation probable")
+                cfg["_block"] = "limit"
+                return done, "blocked"
+            human_pause(page, cfg, counter[0], "unfollow")
+            continue
         if res == "ok":
             st.mark_unfollowed(user)
             done += 1
-            fails = phantoms = 0
+            fails = phantoms = refused = 0
             counter[0] += 1
             log.info("desabonne de @%s", user)
             human_pause(page, cfg, counter[0], "unfollow")
@@ -1553,7 +1671,7 @@ def cmd_run(cfg, here, force=False):
         log.info("Temps de passage du jour deja utilise (%d min) : rien a faire", cfg["daily_minutes"])
         return 0
     cfg["_deadline"] = now() + timedelta(minutes=left) if left is not None else None
-    cfg["_block"], cfg["_recent"], cfg["_checked"] = None, [], set()
+    cfg["_block"], cfg["_recent"], cfg["_checked"], cfg["_slow"] = None, [], set(), 1.0
     started = now()
     longest = max(cfg["unfollow_days_max"], base)
     counter = [0]
@@ -1569,6 +1687,7 @@ def cmd_run(cfg, here, force=False):
                     place_on_bot_desktop(cfg["virtual_desktop"])
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.set_default_timeout(15000)
+                watch_api(page, cfg)
                 if not logged_in(page):
                     log.error("Session TikTok absente ou expiree : relance 'tiktok_rotate.py login'")
                     return 3

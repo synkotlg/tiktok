@@ -74,6 +74,9 @@ Ce que fait le script :
   tour. Ceux qui ont suivi en retour restent suivis au moins `followback_keep_days` (30) jours, et passent
   apres tous les autres dans la file des desabonnements. **`keep_followbacks`** (false par defaut) : a true,
   le script ne s'en desabonne jamais.
+- **Follow-back rattrapes au desabonnement** : la lecture de tes abonnes est plafonnee
+  (`followback_scan_rows`) et peut en manquer. Avant de cliquer, le script regarde le bouton du profil :
+  "Amis" (ou "Suivre en retour") = il te suit. Le follow-back est note, et le compte garde comme les autres.
 - **Moment de la journee** : `status` affiche le follow-back selon l'heure des abonnements (matin,
   apres-midi, soir). Si un moment rend nettement mieux, deplace la tache planifiee (`setup.ps1 -Time 18:30`).
 
@@ -91,6 +94,7 @@ Ce qui depend de toi :
 |---|---|---|
 | `follows_per_day` | 80 | plafond quotidien d'abonnements |
 | `ramp_start`, `ramp_step` | 15, 10 | montee en charge : 15 le premier jour actif, +10 par jour actif |
+| `ramp_window_days` | 14 | seuls les jours actifs de cette fenetre comptent : apres une absence, la montee en charge reprend |
 | `max_follows_per_hour` / `max_unfollows_per_hour` | 20 / 25 | rythme, cumule sur tous les passages |
 | `max_unfollows_per_day` | 100 | plafond quotidien de desabonnements |
 | `max_following` | 1000 | plus de nouvel abonnement au-dela (comptes suivis par le script) |
@@ -117,6 +121,17 @@ bouton affiche "Abonne" mais que TikTok n'enregistre pas. Le script le cherche d
 
 Ces abonnements fantomes sont exclus des statistiques (le compte n'a jamais ete suivi, il ne pouvait rien
 rendre) et comptes dans `status` ("Abonnements ignores par TikTok").
+
+**Reponse de TikTok.** A chaque (des)abonnement, la page envoie une requete a TikTok ; le script lit sa
+reponse (lecture seule). Un refus avec un message reconnu ("Trop de tentatives", "activite inhabituelle")
+vaut blocage immediat ; un refus sans message compte comme un abonnement non pris en compte (3 de suite =
+blocage), meme si le bouton affiche "Abonne". Si cette reponse n'est jamais vue (adresse changee), le
+journal le signale et le controle se fait par le bouton seul, comme avant.
+
+**Apres un captcha resolu**, les pauses sont multipliees par 1.5 jusqu'a la fin du passage (x 3 au plus).
+
+**Apres une absence** (PC eteint, vacances, longue pause), la montee en charge reprend depuis `ramp_start` :
+seuls comptent les jours d'abonnement des `ramp_window_days` (14) derniers jours.
 
 Le script ne resout jamais un captcha lui-meme : il attend que tu le fasses (bascule sur le bureau virtuel 2),
 sinon il se met en pause.

@@ -4,10 +4,14 @@ Elle ne prouve pas que les selecteurs collent au vrai site (seul 'tiktok_rotate.
 mais elle teste les parcours du script. Si TikTok change son DOM, mets d'abord cette maquette a jour
 d'apres les HTML de data/debug, puis les selecteurs (skill maj-selecteurs).
 
+Les (des)abonnements passent par /api/commit/follow/user/ (adresse supposee, FOLLOW_API_RE), qui repond en
+JSON {status_code, status_msg, follow_status}.
+
 Comptes speciaux : 'ghost' n'existe pas ; s* ignorent le clic Suivre (le bouton reste sur Follow) ;
-p* affichent Following apres le clic mais TikTok n'enregistre rien (le profil montre Follow : limitation
-silencieuse) ; d* affichent "Too many attempts" a partir du 3e abonnement ; les comptes de `captcha` affichent
-un captcha ('home' dans `captcha` : captcha des la page d'accueil).
+p* affichent Following, l'API repond 0 mais rien n'est enregistre (le profil montre Follow : limitation
+silencieuse) ; r* affichent Following mais l'API refuse (status_code non nul) ; d* affichent
+"Too many attempts" a partir du 3e abonnement ; les comptes de `captcha` affichent un captcha ('home' dans
+`captcha` : captcha des la page d'accueil).
 """
 import json
 from urllib.parse import parse_qs, urlparse
@@ -17,13 +21,16 @@ PAGE = """<!doctype html><html><body>
 <a href="/upload">Upload</a></header>
 <main>%(main)s</main>
 <script>
-async function act(u, on) { await fetch('/api/follow?u=' + u + '&on=' + on); }
+async function act(u, on) {
+  const r = await fetch('/api/commit/follow/user/?user_id=' + u + '&type=' + on);
+  return (await r.json()).status_code;
+}
 document.addEventListener('click', async e => {
   const b = e.target.closest('button.fb');
   if (!b) return;
   const u = b.dataset.u, t = b.innerText.trim();
   if (/^s\\d/.test(u)) return;
-  if (/^p\\d/.test(u)) { b.innerText = 'Following'; return; }
+  if (/^[pr]\\d/.test(u)) { b.innerText = 'Following'; await act(u, 1); return; }
   if (/^d\\d/.test(u)) {
     window.nd = (window.nd || 0) + 1;
     if (window.nd > 2) {
@@ -34,11 +41,9 @@ document.addEventListener('click', async e => {
     }
   }
   if (t === 'Follow' || t === 'Follow back') {
-    await act(u, 1);
-    b.innerText = t === 'Follow back' ? 'Friends' : 'Following';
+    if (await act(u, 1) === 0) b.innerText = t === 'Follow back' ? 'Friends' : 'Following';
   } else {
-    await act(u, 0);
-    b.innerText = t === 'Friends' ? 'Follow back' : 'Follow';
+    if (await act(u, 0) === 0) b.innerText = t === 'Friends' ? 'Follow back' : 'Follow';
   }
 });
 %(script)s
@@ -108,10 +113,17 @@ class MockTikTok:
 
     def handler(self, route):
         url = urlparse(route.request.url)
-        if url.path == "/api/follow":
+        if url.path == "/api/commit/follow/user/":
             q = parse_qs(url.query)
-            (self.following.add if q["on"][0] == "1" else self.following.discard)(q["u"][0])
-            return route.fulfill(status=200, body="{}", content_type="application/json")
+            user, on = q["user_id"][0], q["type"][0] == "1"
+            kind = user[0] if user[1:2].isdigit() else ""
+            if kind == "r":
+                body = {"status_code": 10221, "status_msg": "", "follow_status": 0}
+            else:
+                if kind != "p":  # p* : accepte en apparence, rien n'est enregistre
+                    (self.following.add if on else self.following.discard)(user)
+                body = {"status_code": 0, "status_msg": "", "follow_status": int(user in self.following)}
+            return route.fulfill(status=200, body=json.dumps(body), content_type="application/json")
         if url.path.startswith("/@"):
             return route.fulfill(status=200, body=self.profile(url.path[2:].strip("/")), content_type="text/html")
         home = self.profile("home") if "home" in self.captcha else self.page("Pour toi")

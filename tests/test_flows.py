@@ -155,11 +155,35 @@ def test_rotation(env, capsys):
     assert users("username LIKE 'e%' AND unfollowed_on IS NULL") == {"e5"}
     assert mock.following == {"a1", "b3"}
 
+    # refus dans la reponse de TikTok alors que le bouton affiche Following : 3 de suite = limitation
+    reset_block(day)
+    mock.followers["seedr"] = [f"r{i}" for i in range(10)]
+    tr.cmd_run(cfg_for(seeds=["seedr"], unfollow_after_days=99), here=True, force=True)
+    assert tr.State(tr.DB_PATH).get_meta("quota_factor") == "0.50"
+    assert not users("username LIKE 'r%'")
+
+    # follow-back vu seulement sur le profil au moment du desabonnement (sans lecture de tes abonnes) :
+    # note et garde ; f1 et f2 sont desabonnes
+    reset_block(day)
+    mock.followers["seedf"] = ["f0", "f1", "f2"]
+    no_scan = dict(adaptive_delay=False, explore_share=0)
+    tr.cmd_run(cfg_for(seeds=["seedf"], unfollow_after_days=99, **no_scan), here=True, force=True)
+    mock.my_followers.add("f0")
+    day[0] += timedelta(days=1)
+    tr.cmd_run(cfg_for(follows_per_day=0, unfollow_after_days=0, **no_scan), here=True, force=True)
+    assert users("followed_back_on IS NOT NULL AND unfollowed_on IS NULL") == {"a1", "b3", "f0"}
+    assert mock.following == {"a1", "b3", "f0"}
+
+    # sans periode de grace, les follow-back sont desabonnes comme les autres (bouton "Friends")
+    tr.cmd_run(cfg_for(follows_per_day=0, unfollow_after_days=0, followback_keep_days=0, **no_scan),
+               here=True, force=True)
+    assert mock.following == set() and not users("unfollowed_on IS NULL")
+
     capsys.readouterr()
     assert tr.cmd_status(cfg_for(seeds=["seeda", "seedb"], seed_scoring=True)) == 0
     out = capsys.readouterr().out
     assert "Rendement des sources" in out and "@seedb" in out and "(retiree de la liste)" in out
-    assert "Abonnements ignores par TikTok (30 j)      : 8" in out
+    assert "Abonnements ignores par TikTok (30 j)      : 9" in out  # e5 en plus
 
     assert tr.cmd_diagnose(cfg_for(username="me", seeds=["seedb"])) == 0
     assert list(tr.SHOTS.glob("*-diag-list-seedb.html"))

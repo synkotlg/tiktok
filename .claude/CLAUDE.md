@@ -29,7 +29,11 @@ Cible : Windows, Edge via Playwright (profil persistant dans `data/profile`), ta
   passes au JS (en JS, `\b` ignore les lettres accentuees).
 - Detection de visibilite : `visible(locator)` (tous les elements visibles), pas `.first.is_visible()`.
 - Toute reaction de TikTok passe par `blocked(page, cfg)`, qui range la nature dans `cfg["_block"]`
-  (`limit`, `captcha`, `warning`, `attention`) ; la politique de pause est `BLOCK_POLICY`.
+  (`limit`, `captcha`, `warning`, `attention`) ; la politique de pause est `BLOCK_POLICY`. Les reponses de
+  l'API aux (des)abonnements (lues par `watch_api`, jamais modifiees) passent par `api_reply` puis
+  `api_reaction` ; l'appelant range aussi la nature dans `cfg["_block"]`. Pas de reponse vue = on se fie
+  au bouton.
+- `profile_state` : `follow`, `fan` (il te suit, toi non), `following`, `friends` (mutuel), None.
 - Le script ne resout jamais un captcha lui-meme et ne cherche pas a masquer l'automatisation.
 - Ne pas relever les quotas par defaut (`follows_per_day`, plafonds horaires, montee en charge).
 - Schema SQLite : ajouter une colonne = l'ajouter au CREATE et prevoir un ALTER pour les bases existantes

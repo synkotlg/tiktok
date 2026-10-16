@@ -35,6 +35,11 @@ def test_regexes():
         assert tr.FOLLOWING_RE.match(text), text
     for text in ("Follow", "Suivre", "Followers", "Message"):
         assert not tr.FOLLOWING_RE.match(text), text
+    for text in ("Friends", "Amis", "Ami(e)s"):
+        assert tr.FRIENDS_RE.match(text) and tr.FOLLOWING_RE.match(text), text
+    for text in ("Following", "Abonné(e)", "Follow back"):
+        assert not tr.FRIENDS_RE.match(text), text
+    assert tr.FOLLOW_API_RE.search("https://www.tiktok.com/api/commit/follow/user/?aid=1988&type=1")
     assert tr.FOLLOWERS_TAB_RE.match("Followers 1,2 k") and not tr.FOLLOWERS_TAB_RE.match("Following 10")
     assert not tr.FOLLOWERS_TAB_RE.match("Abonnements 10")
 
@@ -179,6 +184,32 @@ def test_follow_budget_ramps_up(st):
     for i in range(3):
         add(st, f"u{i}", i + 1)
     assert tr.follow_budget(st, cfg) == cfg["ramp_start"] + 3 * cfg["ramp_step"]
+    add(st, "old", cfg["ramp_window_days"] + 5)  # hors fenetre : ne compte pas
+    assert tr.follow_budget(st, cfg) == cfg["ramp_start"] + 3 * cfg["ramp_step"]
+
+
+def test_follow_budget_ramps_again_after_a_break(st):
+    cfg = dict(tr.DEFAULTS)
+    for i in range(30):
+        add(st, f"u{i}", 20 + i)  # actif pendant un mois, puis 20 jours d'absence
+    assert tr.follow_budget(st, cfg) == cfg["ramp_start"]
+
+
+def test_pauses_slow_down_after_a_captcha(monkeypatch):
+    waits = []
+    page = type("Page", (), {"wait_for_timeout": lambda self, ms: waits.append(ms)})()
+    monkeypatch.setattr(tr, "rnd", lambda lo, hi: 1.0)
+    cfg = dict(tr.DEFAULTS)
+    tr.human_pause(page, cfg, 1, "follow")
+    tr.human_pause(page, dict(cfg, _slow=1.5), 1, "follow")
+    assert waits == [180000, 270000]
+
+
+def test_api_reaction():
+    assert tr.api_reaction(None) is None and tr.api_reaction((0, "")) is None
+    assert tr.api_reaction((10221, "")) == "refused"
+    assert tr.api_reaction((10000, "Too many attempts. Try again later.")) == "limit"
+    assert tr.api_reaction((2, "Unusual activity detected")) == "warning"
 
 
 def test_load_config_reads_seeds_file(tmp_path, monkeypatch):
