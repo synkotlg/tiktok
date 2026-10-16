@@ -9,7 +9,8 @@ JSON {status_code, status_msg, follow_status}.
 
 Comptes speciaux : 'ghost' n'existe pas ; s* ignorent le clic Suivre (le bouton reste sur Follow) ;
 p* affichent Following, l'API repond 0 mais rien n'est enregistre (le profil montre Follow : limitation
-silencieuse) ; r* affichent Following mais l'API refuse (status_code non nul) ; d* affichent
+silencieuse) ; r* affichent Following mais l'API refuse (status_code non nul) ; l'API refuse le
+desabonnement des u* ; `bios` donne la bio d'un profil (data-e2e="user-bio") ; d* affichent
 "Too many attempts" a partir du 3e abonnement ; les comptes de `captcha` affichent un captcha ('home' dans
 `captcha` : captcha des la page d'accueil).
 """
@@ -85,6 +86,7 @@ class MockTikTok:
         self.my_followers = set()   # comptes qui suivent `me`
         self.followers = {}         # source -> liste de ses abonnes (les plus recents d'abord)
         self.captcha = set()
+        self.bios = {}              # pseudo -> bio affichee sur son profil
 
     def label(self, u):
         if u in self.following:
@@ -102,8 +104,9 @@ class MockTikTok:
         fl = sorted(self.my_followers) if u == self.me else self.followers.get(u, [])
         btn = "" if u == self.me else (f'<button class="fb" data-e2e="follow-button" data-u="{u}">'
                                        f'{self.label(u)}</button><button>Message</button>')
+        bio = f'<h2 data-e2e="user-bio">{self.bios[u]}</h2>' if u in self.bios else ""
         main = (f'<div class="info"><div><h1 data-e2e="user-title">{u}</h1>'
-                f'<h2 data-e2e="user-subtitle">Nick</h2></div><div class="btns">{btn}</div></div>'
+                f'<h2 data-e2e="user-subtitle">Nick</h2>{bio}</div><div class="btns">{btn}</div></div>'
                 f'<div><strong data-e2e="following-count">10</strong> Following '
                 f'<strong data-e2e="followers-count">{len(fl)}</strong><span data-e2e="followers">Followers</span></div>'
                 # comptes suggeres : boutons Suivre qui ne doivent jamais etre pris pour celui du profil
@@ -117,8 +120,8 @@ class MockTikTok:
             q = parse_qs(url.query)
             user, on = q["user_id"][0], q["type"][0] == "1"
             kind = user[0] if user[1:2].isdigit() else ""
-            if kind == "r":
-                body = {"status_code": 10221, "status_msg": "", "follow_status": 0}
+            if kind == "r" or (kind == "u" and not on):
+                body = {"status_code": 10221, "status_msg": "", "follow_status": int(user in self.following)}
             else:
                 if kind != "p":  # p* : accepte en apparence, rien n'est enregistre
                     (self.following.add if on else self.following.discard)(user)

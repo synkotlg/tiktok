@@ -33,15 +33,19 @@ Puis, une seule fois :
    (aucun abonnement n'est fait). Si une ligne affiche 0, None ou `hidden`, voir Depannage ;
 4. premier passage visible pour controler : `.\.venv\Scripts\python.exe tiktok_rotate.py run --here --force`.
 
-La tache planifiee `TikTokRotate` lance ensuite un passage chaque jour a 09:00 (plus un delai aleatoire)
-et 5 min apres chaque ouverture de session. Options : `-Time 18:30`, `-DailyOnly`, `-NoTask`, `-Remove`.
+La tache planifiee `TikTokRotate` reveille le script toutes les 20 min (`run --auto`) et 5 min apres chaque
+ouverture de session. A chaque reveil, il decide lui-meme s'il fait une session (voir **Sessions**) ; sinon
+il s'arrete en moins d'une seconde, sans ouvrir le navigateur. Le PC n'est jamais sorti de veille.
+Options : `-Every 30`, `-DailyOnly` (pas de declenchement a l'ouverture de session), `-NoTask`, `-Remove`.
+Apres une mise a jour du script, relance `setup.ps1` : l'ancienne tache (un passage a 09:00) marche encore,
+mais sans sessions.
 
 ## Commandes
 
 | Commande | Role |
 |---|---|
 | `login` | connexion manuelle (code, captcha) ; a refaire si la session expire |
-| `run` | passage quotidien ; `--here` garde la fenetre sur ton bureau, `--force` ignore plage horaire et repos |
+| `run` | une session ; `--here` garde la fenetre sur ton bureau, `--force` fait tout le temps restant du jour maintenant (malgre plage horaire et repos) ; `--auto` = reveil de la tache planifiee |
 | `status` | etat de la rotation, taux de follow-back, classement des sources |
 | `check-seeds` | visite chaque source et ecarte celles qui n'existent pas |
 | `diagnose` | teste chaque selecteur sur ton profil et la premiere source ; captures et HTML dans `data/debug` |
@@ -55,7 +59,7 @@ Ce que fait le script :
   egal a la moyenne globale, puis les sources sont ordonnees par echantillonnage de Thompson : la meilleure
   passe le plus souvent en premier, une source peu testee garde sa chance. `status` affiche le classement.
 - **Abonnes recents, liste rouverte.** TikTok liste les abonnes d'un compte du plus recent au plus ancien :
-  le script prend le haut de la liste, par tranches de `follows_per_seed` (15). Apres chaque tranche la
+  le script prend le haut de la liste, par tranches de `follows_per_seed` (10). Apres chaque tranche la
   source est tiree a nouveau ; si c'est la meme, sa liste rouverte montre les comptes qui viennent de la
   suivre, donc en ligne a cet instant : ils voient ta notification tout de suite. Les tranches reparties
   sur plusieurs sources font aussi apprendre plus vite laquelle rend le mieux.
@@ -77,8 +81,9 @@ Ce que fait le script :
 - **Follow-back rattrapes au desabonnement** : la lecture de tes abonnes est plafonnee
   (`followback_scan_rows`) et peut en manquer. Avant de cliquer, le script regarde le bouton du profil :
   "Amis" (ou "Suivre en retour") = il te suit. Le follow-back est note, et le compte garde comme les autres.
-- **Moment de la journee** : `status` affiche le follow-back selon l'heure des abonnements (matin,
-  apres-midi, soir). Si un moment rend nettement mieux, deplace la tache planifiee (`setup.ps1 -Time 18:30`).
+- **Moment de la journee** : le follow-back est mesure selon l'heure des abonnements (matin, apres-midi,
+  soir ; `status`), et les abonnements vont d'abord aux sessions des moments qui rendent le mieux (voir
+  **Sessions**).
 
 Ce qui depend de toi :
 
@@ -112,9 +117,11 @@ jour sans incident. Compte banni, suspendu ou deconnecte : arret total jusqu'a `
 **Limitation silencieuse.** Le premier signe d'une restriction sur TikTok est souvent un abonnement que le
 bouton affiche "Abonne" mais que TikTok n'enregistre pas. Le script le cherche de deux facons :
 
-- tous les `verify_every` (10) abonnements, il ouvre le profil d'un compte suivi peu avant, dans un second
-  onglet : si l'abonnement n'y figure pas, il en verifie un second ; deux absents = pause de 48 h,
-  quotas x 0.5 (comme "Trop de tentatives") ;
+- a la fin de chaque tranche (au plus `verify_every` = 10 abonnements ; 3 apres une pause ou un captcha
+  resolu), il ouvre le profil d'un compte suivi dans la tranche : si l'abonnement n'y figure pas, il en
+  verifie un second ; deux absents = pause de 48 h, quotas x 0.5 (comme "Trop de tentatives") ;
+- un clic ignore ou refuse est note (il compte dans les plafonds, le compte n'est plus clique) : 3 de
+  suite, ou 4 sur les 12 derniers essais = meme pause ;
 - au desabonnement, un compte deja plus suivi est note "non pris en compte" (sans clic, sans pause, hors
   plafonds) ; `phantom_streak` (5) de suite = meme pause. Seuls comptent les abonnements faits depuis la
   derniere pause : ceux d'avant l'ont deja provoquee.
@@ -127,6 +134,14 @@ reponse (lecture seule). Un refus avec un message reconnu ("Trop de tentatives",
 vaut blocage immediat ; un refus sans message compte comme un abonnement non pris en compte (3 de suite =
 blocage), meme si le bouton affiche "Abonne". Si cette reponse n'est jamais vue (adresse changee), le
 journal le signale et le controle se fait par le bouton seul, comme avant.
+
+**Desabonnements refuses ou en echec** : le compte passe en fin de file et seul son premier ennui compte
+dans les series (3 refus de comptes differents = pause). Refuse 3 fois : abandonne (il reste suivi), pour
+qu'un meme compte en tete de file ne bloque pas chaque passage.
+
+**Textes des profils** : une bio ou un nom qui contient "trop rapidement", "Try again later" ou "Ce compte
+est introuvable" n'est pas pris pour un message de TikTok (seuls comptent les textes hors bio, nom et
+lignes de liste ; un compte n'est introuvable que si son profil ne s'affiche pas).
 
 **Apres un captcha resolu**, les pauses sont multipliees par 1.5 jusqu'a la fin du passage (x 3 au plus).
 
@@ -147,11 +162,15 @@ sinon il se met en pause.
 | `seed_prior_strength` | 20 | poids de la moyenne globale dans l'estimation d'une source |
 | `seed_dry_days` | 3 | une source epuisee passe en dernier pendant ce nombre de jours |
 | `seeds_per_run` | 6 | sources epuisees ou inaccessibles au plus par passage |
-| `follows_per_seed` | 15 | abonnements d'affilee dans une meme liste avant de tirer a nouveau la source |
+| `follows_per_seed` | 10 | abonnements d'affilee dans une meme liste avant de tirer a nouveau la source |
 | `followback_keep_days` | 30 | follow-back gardes au moins ce nombre de jours (0 : meme delai que les autres) |
 | `handle_filter` | true | ecarte les pseudos generiques s'ils rendent nettement moins (`handle_filter_min` 40, `handle_filter_ratio` 0.7, `handle_filter_explore` 0.1) |
 | `unfollow_time_share` | 0.5 | part du temps du jour au plus pour les desabonnements tant qu'il reste des abonnements a faire |
 | `verify_every`, `phantom_streak` | 10, 5 | detection de la limitation silencieuse (0 : desactive) |
+| `day_sessions` | true | une session par partie de journee ; false : une par jour |
+| `session_jitter_minutes` | 45 | debut de chaque session tire au hasard dans ces minutes |
+| `session_min_minutes` | 15 | session plus courte ignoree (sauf la derniere de la journee) |
+| `attendance_days` | 14 | jours observes pour prevoir si le PC sera allume aux sessions suivantes |
 | `virtual_desktop` | 2 | bureau virtuel du navigateur (peut etre partage avec le bot Instagram) |
 | `browser_channel` | msedge | navigateur ; repli sur le Chromium de Playwright |
 | `locale`, `timezone` | fr-FR, Europe/Paris | langue et fuseau du navigateur |
@@ -159,15 +178,36 @@ sinon il se met en pause.
 Toutes les cles et leurs valeurs par defaut sont dans `DEFAULTS` en tete de `tiktok_rotate.py` ; `config.json`
 ne contient que celles que tu veux changer.
 
+## Sessions
+
+Au lieu d'un bloc de 3 h, le script fait une session par partie de la journee dans `active_hours` : matin
+(8-12 h), apres-midi (12-18 h), soir (18-23 h). Chaque session commence a une heure tiree au hasard dans les
+45 premieres minutes de sa partie (differente chaque jour).
+
+- **Temps** : `daily_minutes` est reparti entre les sessions. Chaque session suivante garde sa part si le PC
+  est d'habitude allume a ce moment (mesure sur 14 jours ; au debut, une demi-part) ; la derniere de la
+  journee prend tout ce qui reste. Un PC allume seulement le soir fait donc tout le soir : pas de temps perdu.
+- **Abonnements au meilleur moment** : le follow-back est mesure par partie de journee. Chaque jour, un
+  tirage (Thompson, comme pour les sources) classe les parties : la mieux classee recoit les abonnements en
+  premier, les autres font surtout les desabonnements (qui ne dependent pas de l'heure). Une partie moins
+  bonne garde sa chance d'etre mesuree.
+- **Reveils** : la tache tourne toutes les 20 min ; un reveil hors session ne fait rien (et ne le note
+  qu'une fois par jour dans le journal). Une session coupee (PC eteint) reprend au reveil suivant dans la
+  meme partie, avec ce qui lui reste : le temps est releve avant chaque action.
+
+`status` affiche les sessions du jour : debut prevu, minutes utilisees, abonnements, tirage du jour, et
+combien de jours le PC etait allume a ce moment. `run` lance a la main fait la session en cours ;
+`run --force` fait tout le temps restant du jour, d'un coup.
+
 ## Vitesse reelle
 
 Le debit est fixe par le rythme (une action toutes les 3 min environ, pauses longues comprises : ~17
 abonnements ou ~20 desabonnements par heure) et par `daily_minutes`. Avec 180 min par jour, une fois la
 rotation lancee, cela fait environ 25 a 30 abonnements et autant de desabonnements par jour :
-`follows_per_day` (80) n'est pas atteint. Le temps est partage : les desabonnements en retard prennent au
-plus la moitie du temps restant (`unfollow_time_share`), puis les abonnements, puis de nouveau les
-desabonnements s'il reste du temps. Un desabonnement sans clic (compte disparu, abonnement deja absent) ne
-coute ni pause ni place dans les plafonds.
+`follows_per_day` (80) n'est pas atteint. Les sessions ne changent pas ce total, seulement le moment des
+abonnements. Les desabonnements en attente prennent au plus la moitie du temps de la journee
+(`unfollow_time_share`). Un desabonnement sans clic (compte disparu, abonnement deja absent) ne coute ni
+pause ni place dans les plafonds.
 
 Pour aller plus vite sans augmenter le rythme horaire, il faut plus de temps par jour (`daily_minutes`) :
 c'est plus d'actions par jour, donc plus de risque. A ne faire qu'apres 2 semaines sans aucune reaction de

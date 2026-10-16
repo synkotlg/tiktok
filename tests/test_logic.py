@@ -159,6 +159,127 @@ def test_unfollows_get_a_share_of_the_day(monkeypatch):
     assert tr.unfollow_until(dict(cfg, unfollow_time_share=1), quota=20) is None
 
 
+def test_part_windows():
+    cfg = dict(tr.DEFAULTS)
+    w = tr.part_windows(cfg, TODAY)
+    assert [x[0] for x in w] == [p[0] for p in tr.DAY_PARTS]
+    for name, opens, start, end in w:
+        assert opens <= start <= opens + timedelta(minutes=cfg["session_jitter_minutes"]) < end
+    assert w[0][1].hour == 8 and w[2][3].hour == 23  # plage horaire [8, 23]
+    assert tr.part_windows(cfg, TODAY) == w  # stable pour une date
+    assert len({tr.part_windows(cfg, TODAY + timedelta(days=i))[0][2].time() for i in range(10)}) > 1
+    assert [x[0] for x in tr.part_windows(dict(cfg, active_hours=[10, 16]), TODAY)] == [p[0] for p in tr.DAY_PARTS[:2]]
+    single = tr.part_windows(dict(cfg, day_sessions=False), TODAY)
+    assert len(single) == 1 and single[0][1].hour == 8 and single[0][3].hour == 23
+    assert tr.current_part(w, w[1][1] + timedelta(minutes=5))[0] == tr.DAY_PARTS[1][0]
+    assert tr.current_part(w, w[0][1] - timedelta(minutes=5)) is None
+
+
+def test_attendance():
+    seen = {}
+    assert tr.attendance(seen, TODAY, "m", ["a", "s"], 14) == {"a": 0.5, "s": 0.5}  # a priori
+    for i in range(1, 9):  # 8 jours avec la session du matin ; l'apres-midi 2 fois, le soir toujours
+        seen[(TODAY - timedelta(days=i)).isoformat()] = ["m", "s"] + (["a"] if i <= 2 else [])
+    seen[TODAY.isoformat()] = ["m", "a"]  # aujourd'hui ne compte pas
+    seen[(TODAY - timedelta(days=30)).isoformat()] = ["m", "a"]  # hors fenetre
+    att = tr.attendance(seen, TODAY, "m", ["a", "s"], 14)
+    assert att == {"a": pytest.approx(3 / 10), "s": pytest.approx(9 / 10)}
+
+
+def test_plan_session_shares_the_day():
+    theta = {"m": 0.2, "a": 0.2, "s": 0.2}
+    later = [("a", 300, 1.0), ("s", 300, 1.0)]
+    minutes, quota, ushare = tr.plan_session("m", 240, later, 180, 0, 80, 0, 0, theta, 240, 0.5)
+    assert minutes == pytest.approx(60)  # PC toujours allume : 3 sessions egales
+    minutes, _, _ = tr.plan_session("m", 240, [("a", 300, 0.5), ("s", 300, 0.5)], 180, 0, 80, 0, 0, theta, 240, 0.5)
+    assert minutes == pytest.approx(90)
+    minutes, _, _ = tr.plan_session("m", 240, [("a", 300, 0.0), ("s", 300, 0.0)], 180, 0, 80, 0, 0, theta, 240, 0.5)
+    assert minutes == pytest.approx(180)  # le PC n'est jamais allume ensuite : tout maintenant
+    minutes, quota, _ = tr.plan_session("s", 120, [], 150, 0, 40, 0, 0, theta, 240, 0.5)
+    assert minutes == pytest.approx(120) and quota == 40  # derniere partie : tout ce qui reste
+    minutes, _, _ = tr.plan_session("m", 200, later, 120, 60, 80, 10, 0, theta, 240, 0.5)
+    assert minutes == pytest.approx(0)  # session deja faite (60 min sur 60)
+    minutes, _, _ = tr.plan_session("m", 220, later, 160, 20, 80, 3, 0, theta, 240, 0.5)
+    assert minutes == pytest.approx(40)  # session interrompue : il reste 40 min
+
+
+def test_plan_session_puts_follows_in_the_best_parts():
+    later = [("a", 300, 1.0), ("s", 300, 1.0)]
+    args = dict(window=240, later=later, R=180, used=0, Q=80, done=0, U=90, spf=240, share_u=0.5)
+    best = tr.plan_session("m", theta={"m": 0.3, "a": 0.1, "s": 0.2}, **args)
+    worst = tr.plan_session("m", theta={"m": 0.1, "a": 0.3, "s": 0.2}, **args)
+    # 180 min dont 90 de desabonnements : 22.5 abonnements tiennent ; la meilleure partie en prend 60 min (15)
+    assert best[1] == 15 and best[2] == pytest.approx(0)
+    middle = tr.plan_session("m", theta={"m": 0.2, "a": 0.3, "s": 0.1}, **args)
+    assert middle[1] == 8 and middle[2] == pytest.approx(0.5)  # le reste (7.5) ; desabonnements d'abord
+    assert worst[1] == 0 and worst[2] == 1.0  # les deux autres parties suffisent : desabonnements seulement
+    few = tr.plan_session("m", theta={"m": 0.3, "a": 0.1, "s": 0.2}, **dict(args, Q=10))
+    assert few[1] == 10 and few[2] == pytest.approx(1 / 3)
+
+
+def test_part_draw_is_stable_within_a_day(st):
+    names = [p[0] for p in tr.DAY_PARTS]
+    first = tr.part_draw(st, dict(tr.DEFAULTS), names)
+    assert set(first) == set(names) and tr.part_draw(st, dict(tr.DEFAULTS), names) == first
+
+
+def test_action_seconds_default_then_learned(st):
+    cfg = dict(tr.DEFAULTS)
+    assert tr.action_seconds(st, cfg, "follow") == pytest.approx(180 * 1.05 + 21 + 20)
+    tr.learn_seconds(st, cfg, "follow", 300 * 3, 3)  # trop peu d'actions : ignore
+    assert tr.action_seconds(st, cfg, "follow") == pytest.approx(230)
+    tr.learn_seconds(st, cfg, "follow", 300 * 10, 10)
+    assert tr.action_seconds(st, cfg, "follow") == pytest.approx(0.7 * 230 + 0.3 * 300, abs=0.1)
+
+
+def test_follow_failing():
+    assert not tr.follow_failing([False, True, True, False, True])
+    assert tr.follow_failing([False, True, True, True])
+    assert tr.follow_failing([True, False, True, False, True, False, True])  # un sur deux
+    assert not tr.follow_failing([True] * 2 + [False] * 10 + [True, False, True])  # anciens sortis de la fenetre
+
+
+def test_chunk_size_smaller_when_cautious(st):
+    cfg = dict(tr.DEFAULTS)
+    assert tr.chunk_size(st, cfg, 50) == 10 and tr.chunk_size(st, cfg, 4) == 4
+    st.set_meta("quota_factor", "0.50")  # apres une pause
+    assert tr.chunk_size(st, cfg, 50) == 3
+    st.set_meta("quota_factor", "1.00")
+    assert tr.chunk_size(st, dict(cfg, _slow=1.5), 50) == 3  # captcha resolu dans le passage
+    assert tr.chunk_size(st, dict(cfg, verify_every=0), 50) == 10
+
+
+def test_late_followbacks_do_not_move_the_delay(st):
+    cfg = dict(tr.DEFAULTS)
+    for i in range(100):  # 10 % suivent en retour le 1er jour
+        add(st, f"u{i}", 20, fb_after=1 if i < 10 else None, unf_after=None if i < 10 else 7)
+    base = tr.followback_stats(st.samples(60), cfg, 4)["delay"]
+    for i in range(100, 108):  # follow-back manques par la lecture, vus au desabonnement (jour 4)
+        add(st, f"u{i}", 20, fb_after=4)
+        st.db.execute("UPDATE users SET fb_late=1 WHERE username=?", (f"u{i}",))
+    st.db.commit()
+    assert tr.followback_stats(st.samples(60), cfg, 4)["delay"] == base
+
+
+def test_old_database_gets_new_columns(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE users (username TEXT PRIMARY KEY, followed_on TEXT NOT NULL, followed_at TEXT NOT NULL,"
+               " unfollowed_on TEXT, note TEXT, followed_back_on TEXT, fixed_days INTEGER, unfollowed_at TEXT,"
+               " source TEXT)")
+    db.execute("INSERT INTO users (username, followed_on, followed_at) VALUES ('x', '2026-10-01', '2026-10-01T10:00:00')")
+    db.commit()
+    db.close()
+    st = tr.State(path)
+    st.mark_followed_back("x", late=True)
+    assert st.db.execute("SELECT fb_late FROM users").fetchone() == (1,)
+
+
+def test_reactions_ignore_profile_texts():
+    assert tr.PROFILE_TEXT_SEL and "user-bio" in tr.PROFILE_TEXT_SEL
+
+
 def test_rest_days_never_consecutive():
     cfg = dict(tr.DEFAULTS, rest_day_chance=0.5)
     days = [TODAY + timedelta(days=i) for i in range(730)]

@@ -1,11 +1,15 @@
 # setup.ps1 - installe les dependances et cree la tache planifiee.
-#   .\setup.ps1                  installation + tache (a chaque ouverture de session et chaque jour a 09:00)
-#   .\setup.ps1 -Time 18:30      autre heure pour le declenchement quotidien
+#   .\setup.ps1                  installation + tache (reveil toutes les 20 min, et a l'ouverture de session)
+#   .\setup.ps1 -Every 30        reveil toutes les 30 min
 #   .\setup.ps1 -DailyOnly       pas de declenchement a l'ouverture de session
 #   .\setup.ps1 -NoTask          dependances seulement
 #   .\setup.ps1 -Remove          supprime la tache planifiee
+# Les horaires ne sont plus ici : a chaque reveil, le script decide s'il fait une session (une par partie de
+# la journee, debut au hasard, d'apres active_hours et day_sessions de config.json). Un reveil sans session
+# se termine en moins d'une seconde, sans ouvrir le navigateur. Le PC n'est jamais sorti de veille.
 param(
-    [string]$Time = "09:00",
+    [int]$Every = 20,
+    [string]$Time = "",
     [switch]$DailyOnly,
     [switch]$NoTask,
     [switch]$Remove
@@ -19,6 +23,9 @@ if ($Remove) {
     Write-Host "Tache $taskName supprimee."
     return
 }
+if ($Time) {
+    Write-Warning "-Time est obsolete : les sessions suivent active_hours et day_sessions de config.json."
+}
 
 Set-Location $root
 if (-not (Test-Path ".venv")) {
@@ -30,20 +37,25 @@ if (-not (Test-Path ".venv")) {
 if (-not $NoTask) {
     $pythonw = Join-Path $root ".venv\Scripts\pythonw.exe"
     $user = "$env:USERDOMAIN\$env:USERNAME"
-    $action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$root\tiktok_rotate.py`" run" -WorkingDirectory $root
-    $triggers = @(New-ScheduledTaskTrigger -Daily -At $Time -RandomDelay (New-TimeSpan -Minutes 45))
+    $action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$root\tiktok_rotate.py`" run --auto" -WorkingDirectory $root
+    # chaque jour a 00:00, repete toutes les $Every min pendant 24 h
+    $wake = New-ScheduledTaskTrigger -Daily -At 00:00
+    $wake.Repetition = (New-ScheduledTaskTrigger -Once -At 00:00 -RepetitionInterval (New-TimeSpan -Minutes $Every) `
+        -RepetitionDuration (New-TimeSpan -Days 1)).Repetition
+    $triggers = @($wake)
     if (-not $DailyOnly) {
-        # PC allume plus tard dans la journee : le passage demarre 5 min apres l'ouverture de session
+        # PC allume en cours de journee : premier reveil 5 min apres l'ouverture de session
         $logon = New-ScheduledTaskTrigger -AtLogOn -User $user
         $logon.Delay = "PT5M"
         $triggers += $logon
     }
+    # IgnoreNew : pendant une session, les reveils suivants sont ignores par Windows
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 10)
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
-    $when = if ($DailyOnly) { "chaque jour a $Time (plus un delai aleatoire jusqu'a 45 min)" } else { "5 min apres chaque ouverture de session et chaque jour a $Time" }
-    Write-Host "Tache $taskName creee : $when."
+    $when = if ($DailyOnly) { "reveil toutes les $Every min" } else { "reveil toutes les $Every min et 5 min apres chaque ouverture de session" }
+    Write-Host "Tache $taskName creee : $when ; le script decide des sessions (config.json)."
 }
 
 Write-Host ""

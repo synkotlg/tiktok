@@ -7,8 +7,8 @@ Cible : Windows, Edge via Playwright (profil persistant dans `data/profile`), ta
 
 - `tiktok_rotate.py` : tout le script, un seul fichier. Sections dans l'ordre : UI (selecteurs et textes
   FR + EN de TikTok, scripts JS), DEFAULTS, State (SQLite), statistiques de follow-back (Kaplan-Meier),
-  choix des sources (Thompson), prudence, navigateur, profils et listes, abonnements, follow-back,
-  desabonnements, commandes.
+  choix des sources (Thompson), prudence, sessions de la journee (plan_session : fonctions pures), navigateur,
+  profils et listes, abonnements, follow-back, desabonnements, commandes.
 - `config.json` surcharge `DEFAULTS` ; `seeds.txt` = sources ; `data/` non versionne.
 - `tests/test_logic.py` : logique pure, rapide. `tests/test_flows.py` + `tests/mock_tiktok.py` : parcours
   complets (run, status, diagnose) sur une maquette locale du DOM suppose, Chromium headless, ~2 min.
@@ -17,7 +17,10 @@ Cible : Windows, Edge via Playwright (profil persistant dans `data/profile`), ta
 
 - Tests : `python -m pytest` (pytest.ini ajoute `.` et `tests` au chemin). Seulement la logique :
   `python -m pytest tests/test_logic.py`.
-- Le script : `python tiktok_rotate.py login | run [--here] [--force] | status | check-seeds | diagnose`.
+- Le script : `python tiktok_rotate.py login | run [--here] [--force] [--auto] | status | check-seeds |
+  diagnose`. La tache planifiee (setup.ps1) lance `run --auto` toutes les 20 min ; les horaires des sessions
+  viennent de config.json (`active_hours`, `day_sessions`), jamais de setup.ps1.
+- Les tests de parcours passent `force=True` (pas de sessions) sauf `test_sessions`, qui fige `now`.
 - Ne jamais lancer le script contre le vrai TikTok depuis une session cloud : pas de compte, et c'est le
   compte de l'utilisateur qui prend le risque. Tout se verifie sur la maquette.
 
@@ -38,6 +41,13 @@ Cible : Windows, Edge via Playwright (profil persistant dans `data/profile`), ta
 - Ne pas relever les quotas par defaut (`follows_per_day`, plafonds horaires, montee en charge).
 - Schema SQLite : ajouter une colonne = l'ajouter au CREATE et prevoir un ALTER pour les bases existantes
   (voir la version Instagram).
+- Textes de TikTok cherches dans la page : `tiktok_says(page, rx)` (ignore bio, nom et lignes de liste),
+  jamais `visible(page.get_by_text(rx))` ; compte introuvable : `account_missing(page)`.
+- Etat d'un passage dans `cfg` (cles `_...`), remis a zero dans `cmd_run` : `_skip`, `_attempts`, `_recent`,
+  `_checked` valent pour tout le passage (une source peut etre rouverte plusieurs fois).
+- Clic d'abonnement ignore ou refuse : `add_follow` puis `mark_unfollowed(PHANTOM, action=False)` (compte
+  dans les plafonds, plus jamais clique, hors statistiques). Follow-back vu seulement au desabonnement :
+  `mark_followed_back(late=True)` (colonne `fb_late`, censure dans `samples`).
 - Desabonnement sans clic (compte disparu, abonnement deja absent) : `mark_unfollowed(..., action=False)`,
   sans `unfollowed_at`, donc hors plafonds et sans pause. Abonnement jamais enregistre par TikTok : note
   `PHANTOM`, exclu des statistiques par `REAL_FOLLOW` (a reprendre dans toute nouvelle requete de stats).

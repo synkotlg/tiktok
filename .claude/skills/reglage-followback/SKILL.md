@@ -26,8 +26,10 @@ description: Analyser les resultats du bot TikTok et ajuster sources et reglages
   `max_follows_per_hour` de 25 %.
 - **Par type de pseudo** : si "generique" rend nettement moins, le filtre s'en charge (ligne "filtre des
   pseudos generiques"). S'il rend autant ou plus, rien a faire.
-- **Par moment de l'abonnement** : un ecart net (ex. soir 12 % contre matin 6 %, sur 50+ mesures chacun)
-  justifie de deplacer la tache planifiee : `setup.ps1 -Time 18:30`.
+- **Par moment de l'abonnement** : les sessions placent deja les abonnements dans les meilleures parties
+  (tirage du jour). Verifier dans "Sessions" que le PC est allume aux bonnes parties ("PC allume x/14 j") ;
+  si la meilleure partie n'a presque jamais lieu, conseiller de laisser le PC allume a ce moment-la.
+- **Sessions "un seul passage par jour"** : la tache planifiee est l'ancienne ; relancer `setup.ps1`.
 - **Vitesse** : `daily_minutes` (180) limite a ~25-30 abonnements par jour, quel que soit `follows_per_day`.
 
 ## Leviers, du plus efficace au moins efficace
