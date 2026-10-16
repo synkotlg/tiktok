@@ -4,9 +4,10 @@ Elle ne prouve pas que les selecteurs collent au vrai site (seul 'tiktok_rotate.
 mais elle teste les parcours du script. Si TikTok change son DOM, mets d'abord cette maquette a jour
 d'apres les HTML de data/debug, puis les selecteurs (skill maj-selecteurs).
 
-Comptes speciaux : 'ghost' n'existe pas ; s* ignorent le clic Suivre (limitation silencieuse) ;
-d* affichent "Too many attempts" a partir du 3e abonnement ; les comptes de `captcha` affichent un captcha
-('home' dans `captcha` : captcha des la page d'accueil).
+Comptes speciaux : 'ghost' n'existe pas ; s* ignorent le clic Suivre (le bouton reste sur Follow) ;
+p* affichent Following apres le clic mais TikTok n'enregistre rien (le profil montre Follow : limitation
+silencieuse) ; d* affichent "Too many attempts" a partir du 3e abonnement ; les comptes de `captcha` affichent
+un captcha ('home' dans `captcha` : captcha des la page d'accueil).
 """
 import json
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +23,7 @@ document.addEventListener('click', async e => {
   if (!b) return;
   const u = b.dataset.u, t = b.innerText.trim();
   if (/^s\\d/.test(u)) return;
+  if (/^p\\d/.test(u)) { b.innerText = 'Following'; return; }
   if (/^d\\d/.test(u)) {
     window.nd = (window.nd || 0) + 1;
     if (window.nd > 2) {

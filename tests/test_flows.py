@@ -83,19 +83,20 @@ def test_rotation(env, capsys):
     assert st.get_meta("seed_dry_until:seeda") and not st.get_meta("seed_dry_until:seedb")
     assert json.loads((tr.ROOT / "config.json").read_text())["username"] == "me"
 
-    # jour 3 : a1 et b3 ont suivi en retour ; tout le monde est desabonne sauf le groupe temoin
+    # jour 3 : a1 et b3 ont suivi en retour ; tout le monde est desabonne sauf le groupe temoin et eux
+    # (follow-back gardes followback_keep_days jours)
     mock.my_followers |= {"a1", "b3"}
     day[0] += timedelta(days=2)
     assert tr.cmd_run(cfg_for(follows_per_day=0), here=True, force=True) == 0
     assert users("followed_back_on IS NOT NULL") == {"a1", "b3"}
     fixed = users("fixed_days IS NOT NULL")
-    assert users("unfollowed_on IS NOT NULL") == set(src) - fixed
-    assert mock.following == fixed and "sugg1" not in mock.following
+    assert users("unfollowed_on IS NOT NULL") == set(src) - fixed - {"a1", "b3"}
+    assert mock.following == fixed | {"a1", "b3"} and "sugg1" not in mock.following
 
     # jour 13, keep_followbacks : le groupe temoin est desabonne, sauf ceux qui ont suivi en retour
     day[0] += timedelta(days=10)
     assert tr.cmd_run(cfg_for(follows_per_day=0, keep_followbacks=True), here=True, force=True) == 0
-    assert mock.following == fixed & {"a1", "b3"}
+    assert mock.following == {"a1", "b3"}
 
     # source introuvable puis captcha non resolu : pause courte, quotas a 75 %
     mock.captcha.add("seedb")
@@ -113,7 +114,7 @@ def test_rotation(env, capsys):
 
     # message "Too many attempts" : arret immediat
     reset_block(day)
-    tr.cmd_run(cfg_for(seeds=["seedd"], unfollow_after_days=99), here=True, force=True)
+    tr.cmd_run(cfg_for(seeds=["seedd"], unfollow_after_days=99, explore_share=0), here=True, force=True)
     assert tr.State(tr.DB_PATH).get_meta("quota_factor") == "0.50"
     assert {u for u in mock.following if u.startswith("d")} == {"d0", "d1"}
 
@@ -127,10 +128,38 @@ def test_rotation(env, capsys):
     assert st.get_meta("last_scan_on") != day[0].isoformat()
     mock.captcha.clear()
 
+    # limitation silencieuse : le bouton passe a Following sans que rien ne soit enregistre ; le sondage
+    # sur les profils (verify_every) trouve deux abonnements absents : pause, quotas a 50 %
+    reset_block(day)
+    mock.followers["seedp"] = [f"p{i}" for i in range(10)]
+    tr.cmd_run(cfg_for(seeds=["seedp"], unfollow_after_days=99, verify_every=3, explore_share=0),
+               here=True, force=True)
+    assert tr.State(tr.DB_PATH).get_meta("quota_factor") == "0.50"
+    assert users(f"note = '{tr.PHANTOM}' AND unfollowed_at IS NULL") == {"p0", "p1"}
+    assert users("username LIKE 'p%' AND unfollowed_on IS NULL") == {"p2"}
+
+    # abonnements disparus constates au desabonnement : rien a cliquer ni a decompter, et blocage apres
+    # phantom_streak comptes de suite (d0 et d1, vraiment suivis, sont desabonnes avant ; p2, suivi avant le
+    # blocage precedent, est note sans compter : il a deja valu une pause)
+    reset_block(day)
+    mock.followers["seede"] = [f"e{i}" for i in range(6)]
+    tr.cmd_run(cfg_for(seeds=["seede"], unfollow_after_days=99, explore_share=0), here=True, force=True)
+    mock.following -= {f"e{i}" for i in range(6)}
+    day[0] += timedelta(days=1)
+    tr.cmd_run(cfg_for(follows_per_day=0, unfollow_after_days=0, adaptive_delay=False), here=True, force=True)
+    st = tr.State(tr.DB_PATH)
+    assert st.get_meta("quota_factor") == "0.50"
+    assert users(f"unfollowed_at IS NOT NULL AND unfollowed_on = '{day[0].isoformat()}'") == {"d0", "d1"}
+    assert st.unfollowed_today() == 2
+    assert users(f"note = '{tr.PHANTOM}' AND unfollowed_at IS NULL") == {"p0", "p1", "p2"} | {f"e{i}" for i in range(5)}
+    assert users("username LIKE 'e%' AND unfollowed_on IS NULL") == {"e5"}
+    assert mock.following == {"a1", "b3"}
+
     capsys.readouterr()
     assert tr.cmd_status(cfg_for(seeds=["seeda", "seedb"], seed_scoring=True)) == 0
     out = capsys.readouterr().out
     assert "Rendement des sources" in out and "@seedb" in out and "(retiree de la liste)" in out
+    assert "Abonnements ignores par TikTok (30 j)      : 8" in out
 
     assert tr.cmd_diagnose(cfg_for(username="me", seeds=["seedb"])) == 0
     assert list(tr.SHOTS.glob("*-diag-list-seedb.html"))

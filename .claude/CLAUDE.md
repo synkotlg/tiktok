@@ -34,6 +34,11 @@ Cible : Windows, Edge via Playwright (profil persistant dans `data/profile`), ta
 - Ne pas relever les quotas par defaut (`follows_per_day`, plafonds horaires, montee en charge).
 - Schema SQLite : ajouter une colonne = l'ajouter au CREATE et prevoir un ALTER pour les bases existantes
   (voir la version Instagram).
+- Desabonnement sans clic (compte disparu, abonnement deja absent) : `mark_unfollowed(..., action=False)`,
+  sans `unfollowed_at`, donc hors plafonds et sans pause. Abonnement jamais enregistre par TikTok : note
+  `PHANTOM`, exclu des statistiques par `REAL_FOLLOW` (a reprendre dans toute nouvelle requete de stats).
+- Toute statistique de follow-back qui compare des groupes (sources, type de pseudo, heure) utilise la meme
+  fenetre `seed_score_days` (`seed_table`, `scored`) et l'a priori `beta_scores`.
 - Toute modification de la section UI : mettre a jour `tests/mock_tiktok.py` pour qu'elle reflete le DOM
   reel (d'apres les HTML de `data/debug` fournis par l'utilisateur), puis relancer les tests.
 

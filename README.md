@@ -54,16 +54,28 @@ Ce que fait le script :
   de chaque source (sous `seed_score_days` jours, la meme fenetre pour toutes) est estime avec un a priori
   egal a la moyenne globale, puis les sources sont ordonnees par echantillonnage de Thompson : la meilleure
   passe le plus souvent en premier, une source peu testee garde sa chance. `status` affiche le classement.
-- **Abonnes recents.** TikTok liste les abonnes d'un compte du plus recent au plus ancien : le script prend
-  le haut de la liste, donc des comptes actifs.
+- **Abonnes recents, liste rouverte.** TikTok liste les abonnes d'un compte du plus recent au plus ancien :
+  le script prend le haut de la liste, par tranches de `follows_per_seed` (15). Apres chaque tranche la
+  source est tiree a nouveau ; si c'est la meme, sa liste rouverte montre les comptes qui viennent de la
+  suivre, donc en ligne a cet instant : ils voient ta notification tout de suite. Les tranches reparties
+  sur plusieurs sources font aussi apprendre plus vite laquelle rend le mieux.
+- **Pseudos generiques evites s'ils rendent moins.** Les comptes au pseudo attribue d'office par TikTok
+  (`user` + chiffres) regardent souvent sans publier. Leur follow-back est mesure a part (`status`) ; des
+  que chaque groupe a `handle_filter_min` (40) mesures, ils sont ecartes s'ils rendent nettement moins
+  (moins de `handle_filter_ratio` = 70 % du taux des autres), sauf 10 % gardes pour continuer a mesurer.
+  Ecarter un compte coute un peu de defilement ; un abonnement coute plusieurs minutes du plafond horaire.
 - **Pas de doublon inutile.** Les comptes qui te suivent deja ("Suivre en retour") sont ignores : ils ne
   rapporteraient rien.
 - **Delai adaptatif.** Le delai de desabonnement est le plus court qui capte 90 % des follow-back observes ;
   20 % des comptes (groupe temoin) restent suivis le delai maximal pour continuer a mesurer.
 - **Ratio abonnements / abonnes bas.** Les desabonnements reguliers gardent ton nombre d'abonnements faible :
   un profil qui suit 5 000 comptes inspire moins le follow-back.
-- **`keep_followbacks`** (false par defaut, comme la version Instagram) : a true, le script reste abonne aux
-  comptes qui ont suivi en retour, pour ne pas les perdre quand il se desabonne.
+- **Follow-back gardes** : se desabonner juste apres un follow-back pousse le compte a se desabonner a son
+  tour. Ceux qui ont suivi en retour restent suivis au moins `followback_keep_days` (30) jours, et passent
+  apres tous les autres dans la file des desabonnements. **`keep_followbacks`** (false par defaut) : a true,
+  le script ne s'en desabonne jamais.
+- **Moment de la journee** : `status` affiche le follow-back selon l'heure des abonnements (matin,
+  apres-midi, soir). Si un moment rend nettement mieux, deplace la tache planifiee (`setup.ps1 -Time 18:30`).
 
 Ce qui depend de toi :
 
@@ -93,6 +105,19 @@ Ce qui depend de toi :
 Chaque pause double si les blocages se rapprochent (14 jours au plus). Les quotas remontent de 10 points par
 jour sans incident. Compte banni, suspendu ou deconnecte : arret total jusqu'a `login`.
 
+**Limitation silencieuse.** Le premier signe d'une restriction sur TikTok est souvent un abonnement que le
+bouton affiche "Abonne" mais que TikTok n'enregistre pas. Le script le cherche de deux facons :
+
+- tous les `verify_every` (10) abonnements, il ouvre le profil d'un compte suivi peu avant, dans un second
+  onglet : si l'abonnement n'y figure pas, il en verifie un second ; deux absents = pause de 48 h,
+  quotas x 0.5 (comme "Trop de tentatives") ;
+- au desabonnement, un compte deja plus suivi est note "non pris en compte" (sans clic, sans pause, hors
+  plafonds) ; `phantom_streak` (5) de suite = meme pause. Seuls comptent les abonnements faits depuis la
+  derniere pause : ceux d'avant l'ont deja provoquee.
+
+Ces abonnements fantomes sont exclus des statistiques (le compte n'a jamais ete suivi, il ne pouvait rien
+rendre) et comptes dans `status` ("Abonnements ignores par TikTok").
+
 Le script ne resout jamais un captcha lui-meme : il attend que tu le fasses (bascule sur le bureau virtuel 2),
 sinon il se met en pause.
 
@@ -106,13 +131,32 @@ sinon il se met en pause.
 | `seed_score_days` | 2 | fenetre de follow-back pour classer les sources |
 | `seed_prior_strength` | 20 | poids de la moyenne globale dans l'estimation d'une source |
 | `seed_dry_days` | 3 | une source epuisee passe en dernier pendant ce nombre de jours |
-| `seeds_per_run` | 6 | sources essayees au plus par passage |
+| `seeds_per_run` | 6 | sources epuisees ou inaccessibles au plus par passage |
+| `follows_per_seed` | 15 | abonnements d'affilee dans une meme liste avant de tirer a nouveau la source |
+| `followback_keep_days` | 30 | follow-back gardes au moins ce nombre de jours (0 : meme delai que les autres) |
+| `handle_filter` | true | ecarte les pseudos generiques s'ils rendent nettement moins (`handle_filter_min` 40, `handle_filter_ratio` 0.7, `handle_filter_explore` 0.1) |
+| `unfollow_time_share` | 0.5 | part du temps du jour au plus pour les desabonnements tant qu'il reste des abonnements a faire |
+| `verify_every`, `phantom_streak` | 10, 5 | detection de la limitation silencieuse (0 : desactive) |
 | `virtual_desktop` | 2 | bureau virtuel du navigateur (peut etre partage avec le bot Instagram) |
 | `browser_channel` | msedge | navigateur ; repli sur le Chromium de Playwright |
 | `locale`, `timezone` | fr-FR, Europe/Paris | langue et fuseau du navigateur |
 
 Toutes les cles et leurs valeurs par defaut sont dans `DEFAULTS` en tete de `tiktok_rotate.py` ; `config.json`
 ne contient que celles que tu veux changer.
+
+## Vitesse reelle
+
+Le debit est fixe par le rythme (une action toutes les 3 min environ, pauses longues comprises : ~17
+abonnements ou ~20 desabonnements par heure) et par `daily_minutes`. Avec 180 min par jour, une fois la
+rotation lancee, cela fait environ 25 a 30 abonnements et autant de desabonnements par jour :
+`follows_per_day` (80) n'est pas atteint. Le temps est partage : les desabonnements en retard prennent au
+plus la moitie du temps restant (`unfollow_time_share`), puis les abonnements, puis de nouveau les
+desabonnements s'il reste du temps. Un desabonnement sans clic (compte disparu, abonnement deja absent) ne
+coute ni pause ni place dans les plafonds.
+
+Pour aller plus vite sans augmenter le rythme horaire, il faut plus de temps par jour (`daily_minutes`) :
+c'est plus d'actions par jour, donc plus de risque. A ne faire qu'apres 2 semaines sans aucune reaction de
+TikTok, par paliers de 60 min.
 
 ## Depannage
 

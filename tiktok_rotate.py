@@ -82,6 +82,9 @@ FOLLOWERS_LABEL_SEL = '[data-e2e="followers"]'
 DIALOG_SEL = 'div[role="dialog"], section[role="dialog"], [data-e2e="follow-info-popup"]'
 ROW_LINK_SEL = 'a[href*="/@"]'
 PROFILE_BTN_SEL = '[data-rot-btn]'
+# Pseudo attribue d'office par TikTok a l'inscription ("user" suivi de chiffres) : souvent un compte qui
+# regarde sans publier. Sert seulement a mesurer si ces comptes suivent moins en retour (handle_filter).
+GENERIC_HANDLE_RE = re.compile(r"^user(?=(?:[a-z]*\d){5})[a-z0-9]{6,}$")
 
 # Pour chaque bouton de la liste : pseudo de sa ligne. On remonte les ancetres jusqu'au premier qui
 # contient un lien de profil ; s'il en contient plusieurs (ligne sans lien, on a remonte jusqu'a la
@@ -143,18 +146,28 @@ JS_SCROLLER = r"""(root, dy) => {
 # ---------------------------------------------------------------------------
 DEFAULTS = {
     "username": "",
-    # sources : seeds.txt (ou la cle "seeds" de config.json) ; une seule par passage ; au plus
-    # seeds_per_run si la source du passage est epuisee ou inaccessible
+    # sources : seeds.txt (ou la cle "seeds" de config.json). Par tranches de follows_per_seed abonnements :
+    # apres chaque tranche la source est tiree a nouveau, et sa liste rouverte montre ses abonnes les plus
+    # recents (en ligne a cet instant). Au plus seeds_per_run sources epuisees ou inaccessibles par passage.
     "seeds_per_run": 6,
+    "follows_per_seed": 15,
     "follows_per_day": 80,
     "unfollow_after_days": 4,
     # true : on reste abonne aux comptes qui ont suivi en retour (ils ne sont plus desabonnes)
     "keep_followbacks": False,
+    # sinon, ils restent suivis au moins ce nombre de jours (0 : meme delai que les autres) : se desabonner
+    # juste apres leur follow-back les pousse a se desabonner a leur tour
+    "followback_keep_days": 30,
     # choix des sources selon leur taux de follow-back (false : simple rotation dans l'ordre de seeds.txt)
     "seed_scoring": True,
     "seed_score_days": 2,
     "seed_prior_strength": 20,
     "seed_dry_days": 3,
+    # pseudos generiques (user123...) evites si leur follow-back mesure est nettement plus faible
+    "handle_filter": True,
+    "handle_filter_min": 40,
+    "handle_filter_ratio": 0.7,
+    "handle_filter_explore": 0.1,
     # prudence : montee en charge, plafonds, plage horaire, repos, reaction aux blocages
     "ramp_start": 15,
     "ramp_step": 10,
@@ -162,6 +175,13 @@ DEFAULTS = {
     "max_unfollows_per_hour": 25,
     "max_unfollows_per_day": 100,
     "max_following": 1000,
+    # part du temps du jour au plus pour les desabonnements tant qu'il reste des abonnements a faire
+    "unfollow_time_share": 0.5,
+    # limitation silencieuse (TikTok ignore les abonnements sans message) : un abonnement recent est
+    # verifie sur son profil tous les verify_every abonnements, et phantom_streak comptes de suite deja
+    # plus suivis au moment du desabonnement valent un blocage (0 : desactive)
+    "verify_every": 10,
+    "phantom_streak": 5,
     "max_wait_minutes": 75,
     "pause_jitter": [0.6, 1.5],
     "long_pause_every": 10,
@@ -251,6 +271,12 @@ def now():
     return datetime.now()
 
 
+# Note d'un abonnement que TikTok n'a jamais enregistre (bouton revenu sur Suivre) : sans follow-back, il
+# ne compte pas dans les statistiques (le compte n'a jamais ete suivi, il n'a rien pu rendre).
+PHANTOM = "non pris en compte"
+REAL_FOLLOW = f"NOT (COALESCE(note, '') = '{PHANTOM}' AND followed_back_on IS NULL)"
+
+
 class State:
     def __init__(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -274,10 +300,16 @@ class State:
             (user, today().isoformat(), now().isoformat(timespec="seconds"), fixed_days, source))
         self.db.commit()
 
-    def mark_unfollowed(self, user, note=None):
+    def mark_unfollowed(self, user, note=None, action=True):
+        """action=False : rien n'a ete clique (compte disparu, abonnement absent) ; sans horodatage, cela ne
+        compte ni dans le plafond horaire ni dans le plafond quotidien."""
         self.db.execute("UPDATE users SET unfollowed_on=?, unfollowed_at=?, note=? WHERE username=?",
-                        (today().isoformat(), now().isoformat(timespec="seconds"), note, user))
+                        (today().isoformat(), now().isoformat(timespec="seconds") if action else None, note, user))
         self.db.commit()
+
+    def followed_at(self, user):
+        row = self.db.execute("SELECT followed_at FROM users WHERE username=?", (user,)).fetchone()
+        return row[0] if row else ""
 
     def mark_followed_back(self, user):
         self.db.execute("UPDATE users SET followed_back_on=? WHERE username=? AND followed_back_on IS NULL",
@@ -288,7 +320,7 @@ class State:
         return self.count("followed_on=?", (today().isoformat(),))
 
     def unfollowed_today(self):
-        return self.count("unfollowed_on=?", (today().isoformat(),))
+        return self.count("unfollowed_on=? AND unfollowed_at IS NOT NULL", (today().isoformat(),))
 
     def following(self, keep_followbacks=False):
         """Abonnements en cours faits par le script (hors follow-back gardes si keep_followbacks)."""
@@ -306,13 +338,16 @@ class State:
                                (since.isoformat(timespec="seconds"),)).fetchall()
         return [r[0] for r in rows]
 
-    def due(self, days, limit, keep_followbacks=False):
-        """Comptes a desabonner : age >= delai propre au compte, sinon `days` (delai courant)."""
+    def due(self, days, limit, keep_followbacks=False, keep_days=0):
+        """Comptes a desabonner : age >= delai propre au compte, sinon `days` (delai courant) ; ceux qui ont
+        suivi en retour, pas avant `keep_days` jours. Ceux qui n'ont rien rendu passent en premier."""
         rows = self.db.execute(
             "SELECT username FROM users WHERE unfollowed_on IS NULL "
             + ("AND followed_back_on IS NULL " if keep_followbacks else "") +
-            "AND date(followed_on, '+' || COALESCE(fixed_days, ?) || ' days') <= ? "
-            "ORDER BY followed_on, username LIMIT ?", (days, today().isoformat(), limit)).fetchall()
+            "AND date(followed_on, '+' || (CASE WHEN followed_back_on IS NULL THEN COALESCE(fixed_days, ?) "
+            "     ELSE MAX(COALESCE(fixed_days, ?), ?) END) || ' days') <= ? "
+            "ORDER BY followed_back_on IS NOT NULL, followed_on, username LIMIT ?",
+            (days, days, keep_days, today().isoformat(), limit)).fetchall()
         return [r[0] for r in rows]
 
     def pending(self):
@@ -327,7 +362,8 @@ class State:
         since = (today() - timedelta(days=window_days)).isoformat()
         out = []
         for f, fb, uf in self.db.execute(
-                "SELECT followed_on, followed_back_on, unfollowed_on FROM users WHERE followed_on>=?", (since,)):
+                "SELECT followed_on, followed_back_on, unfollowed_on FROM users WHERE followed_on>=? AND "
+                + REAL_FOLLOW, (since,)):
             start = date.fromisoformat(f)
             if fb:
                 out.append(((date.fromisoformat(fb) - start).days, True))
@@ -345,8 +381,19 @@ class State:
             " SUM(CASE WHEN followed_on <= ? THEN 1 ELSE 0 END), "
             " SUM(CASE WHEN followed_on <= ? AND followed_back_on IS NOT NULL "
             "      AND julianday(followed_back_on) - julianday(followed_on) <= ? THEN 1 ELSE 0 END) "
-            "FROM users WHERE source IS NOT NULL GROUP BY source", (cutoff, cutoff, score_days)).fetchall()
+            "FROM users WHERE source IS NOT NULL AND " + REAL_FOLLOW + " GROUP BY source",
+            (cutoff, cutoff, score_days)).fetchall()
         return {s: {"total": t, "n": n or 0, "fb": fb or 0} for s, t, n, fb in rows}
+
+    def scored(self, score_days):
+        """[(pseudo, followed_at, follow-back sous `score_days` jours)] pour les comptes suivis il y a au
+        moins `score_days` jours : meme fenetre que seed_table, pour comparer des groupes de comptes."""
+        cutoff = (today() - timedelta(days=score_days)).isoformat()
+        rows = self.db.execute(
+            "SELECT username, followed_at, followed_back_on IS NOT NULL "
+            " AND julianday(followed_back_on) - julianday(followed_on) <= ? "
+            "FROM users WHERE followed_on <= ? AND " + REAL_FOLLOW, (score_days, cutoff)).fetchall()
+        return [(u, at, bool(fb)) for u, at, fb in rows]
 
     def count(self, where="1=1", args=()):
         return self.db.execute(f"SELECT COUNT(*) FROM users WHERE {where}", args).fetchone()[0]
@@ -415,20 +462,65 @@ def describe(stats):
 # ---------------------------------------------------------------------------
 # Choix des sources : celles dont les abonnes suivent le plus en retour passent en premier
 # ---------------------------------------------------------------------------
-def seed_scores(st, cfg, seeds):
-    """{source: (alpha, beta)} : loi Beta du taux de follow-back de chaque source. L'a priori est le taux
-    global, avec un poids de seed_prior_strength comptes : une source peu testee reste proche de la
-    moyenne, une source bien mesuree s'en ecarte selon ses resultats."""
-    table = st.seed_table(cfg["seed_score_days"])
+def beta_scores(table, keys, strength):
+    """{cle: (alpha, beta)} : loi Beta du taux de follow-back de chaque groupe de `table` ({cle: {n, fb}}).
+    L'a priori est le taux global, avec un poids de `strength` comptes : un groupe peu teste reste proche
+    de la moyenne, un groupe bien mesure s'en ecarte selon ses resultats."""
     n_all = sum(v["n"] for v in table.values())
     fb_all = sum(v["fb"] for v in table.values())
     prior = (fb_all + 1) / (n_all + 2)
-    k = max(1.0, float(cfg["seed_prior_strength"]))
+    k = max(1.0, float(strength))
     out = {}
-    for s in seeds:
+    for s in keys:
         v = table.get(s, {"n": 0, "fb": 0})
         out[s] = (k * prior + v["fb"], k * (1 - prior) + v["n"] - v["fb"])
     return out
+
+
+def seed_scores(st, cfg, seeds):
+    """{source: (alpha, beta)} : loi Beta du taux de follow-back de chaque source (voir beta_scores)."""
+    return beta_scores(st.seed_table(cfg["seed_score_days"]), seeds, cfg["seed_prior_strength"])
+
+
+def segment_table(rows, key):
+    """{groupe: {n, fb}} a partir de State.scored, groupe = key(pseudo, followed_at)."""
+    out = {}
+    for user, at, fb in rows:
+        v = out.setdefault(key(user, at), {"n": 0, "fb": 0})
+        v["n"] += 1
+        v["fb"] += fb
+    return out
+
+
+def handle_kind(user, at=None):
+    return "generique" if GENERIC_HANDLE_RE.match(user) else "perso"
+
+
+def day_part(user, at):
+    hour = int(at[11:13])
+    return "matin (avant 12 h)" if hour < 12 else "apres-midi (12-18 h)" if hour < 18 else "soir (apres 18 h)"
+
+
+def handle_filter(st, cfg):
+    """Fonction pseudo -> True s'il vaut un abonnement. Les pseudos generiques sont compares aux autres sur
+    la meme fenetre que les sources. Tant que chaque groupe n'a pas handle_filter_min comptes mesures, tout
+    est suivi. Ensuite, pour chaque pseudo generique, on tire un taux plausible pour chaque groupe (Thompson)
+    et on ne le suit que si le sien atteint handle_filter_ratio fois celui des autres. Ecarter un compte ne
+    coute qu'un peu de defilement, un abonnement coute plusieurs minutes du plafond horaire.
+    handle_filter_explore des pseudos generiques sont suivis quoi qu'il arrive, pour continuer a mesurer."""
+    if not cfg["handle_filter"]:
+        return lambda user: True
+    table = segment_table(st.scored(cfg["seed_score_days"]), handle_kind)
+    if min(table.get(k, {"n": 0})["n"] for k in ("generique", "perso")) < cfg["handle_filter_min"]:
+        return lambda user: True
+    scores = beta_scores(table, ["generique", "perso"], cfg["seed_prior_strength"])
+
+    def wanted(user):
+        if handle_kind(user) == "perso" or random.random() < cfg["handle_filter_explore"]:
+            return True
+        return random.betavariate(*scores["generique"]) >= cfg["handle_filter_ratio"] * random.betavariate(
+            *scores["perso"])
+    return wanted
 
 
 def seed_rotation(seeds, last):
@@ -496,6 +588,7 @@ def register_block(st, cfg, kind):
     st.set_meta("block_streak", str(streak))
     st.set_meta("quota_factor", f"{factor:.2f}")
     st.set_meta("blocked_until", (now() + timedelta(hours=hours)).isoformat(timespec="seconds"))
+    st.set_meta("last_block_at", now().isoformat(timespec="seconds"))
     st.set_meta("last_clean_on", today().isoformat())  # pas de remontee le jour meme
     return hours, factor
 
@@ -535,6 +628,21 @@ def keep_awake(on):
         fn(0x80000000 | (0x00000001 if on else 0))  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
     except Exception:
         pass
+
+
+def day_over(cfg):
+    """True si la plage horaire est finie ou le temps de passage du jour ecoule."""
+    moment, deadline = now(), cfg.get("_deadline")
+    return not in_active_hours(cfg, moment) or bool(deadline and moment >= deadline)
+
+
+def unfollow_until(cfg, quota):
+    """Fin de la part du temps reservee aux desabonnements (None : sans limite). Sans elle, un retard de
+    desabonnements (apres une pause) prendrait tout le temps du jour et aucun abonnement ne se ferait."""
+    deadline, share = cfg.get("_deadline"), cfg["unfollow_time_share"]
+    if not (quota and deadline) or share >= 1:
+        return None
+    return now() + max(timedelta(0), deadline - now()) * share
 
 
 def throttle(page, st, cfg, kind):
@@ -878,10 +986,10 @@ def scroll_dialog(page, dlg):
 # ---------------------------------------------------------------------------
 # Abonnements
 # ---------------------------------------------------------------------------
-def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: None):
+def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: None, wanted=lambda u: True):
     """Suit jusqu'a `quota` abonnes de `seed` (bouton "Suivre" seulement : ceux qui te suivent deja
-    affichent "Suivre en retour" et sont ignores). Retourne (nombre, 'ok' | 'dry' | 'skip' | 'stop' |
-    'blocked') ; 'dry' = plus aucun compte a suivre dans cette liste."""
+    affichent "Suivre en retour" et sont ignores ; `wanted` ecarte ceux qui rapportent trop peu). Retourne
+    (nombre, 'ok' | 'dry' | 'skip' | 'stop' | 'blocked') ; 'dry' = plus aucun compte a suivre dans cette liste."""
     dlg, res = open_followers(page, seed, cfg)
     if dlg is None:
         if res == "blocked":
@@ -892,56 +1000,69 @@ def follow_from_seed(page, seed, quota, st, cfg, counter, fixed_days=lambda: Non
         shot(page, cfg, f"followers-{seed}")
         return 0, "skip"
     me = cfg["username"]
-    done = fails = scrolls = stalls = 0
+    recent = cfg.setdefault("_recent", [])
+    done = fails = scrolls = stalls = filtered = 0
     skip, rows = set(), set()
-    while done < quota:
-        btns = dlg.get_by_role("button", name=FOLLOW_RE)
-        users = btns.evaluate_all(JS_USERS)
-        idx = next((i for i, u in enumerate(users)
-                    if u and u != me and u not in skip and not st.known(u)), None)
-        if idx is None:  # rien d'eligible a l'ecran : on descend dans la liste
-            if scrolls >= cfg["max_scrolls_per_seed"]:
-                return done, "dry"
-            scroll_dialog(page, dlg)
-            scrolls += 1
+    try:
+        while done < quota:
+            btns = dlg.get_by_role("button", name=FOLLOW_RE)
+            users = btns.evaluate_all(JS_USERS)
+            idx = next((i for i, u in enumerate(users)
+                        if u and u != me and u not in skip and not st.known(u)), None)
+            if idx is None:  # rien d'eligible a l'ecran : on descend dans la liste
+                if scrolls >= cfg["max_scrolls_per_seed"]:
+                    return done, "dry"
+                scroll_dialog(page, dlg)
+                scrolls += 1
+                if blocked(page, cfg):
+                    shot(page, cfg, "blocked-scroll")
+                    return done, "blocked"
+                now_rows = list_users(dlg)
+                stalls = 0 if now_rows - rows else stalls + 1
+                rows |= now_rows
+                if stalls >= 3:  # fin de liste
+                    return done, "dry"
+                continue
+            user = users[idx]
+            if not wanted(user):
+                skip.add(user)
+                filtered += 1
+                continue
+            if not throttle(page, st, cfg, "follow"):
+                return done, "stop"
+            try:
+                btns.nth(idx).click(timeout=8000)
+            except PWTimeout:
+                skip.add(user)
+                continue
+            page.wait_for_timeout(rnd(1500, 2500))
             if blocked(page, cfg):
-                shot(page, cfg, "blocked-scroll")
+                shot(page, cfg, "blocked-follow")
                 return done, "blocked"
-            now_rows = list_users(dlg)
-            stalls = 0 if now_rows - rows else stalls + 1
-            rows |= now_rows
-            if stalls >= 3:  # fin de liste
-                return done, "dry"
-            continue
-        user = users[idx]
-        if not throttle(page, st, cfg, "follow"):
-            return done, "stop"
-        try:
-            btns.nth(idx).click(timeout=8000)
-        except PWTimeout:
-            skip.add(user)
-            continue
-        page.wait_for_timeout(rnd(1500, 2500))
-        if blocked(page, cfg):
-            shot(page, cfg, "blocked-follow")
-            return done, "blocked"
-        if not follow_registered(page, dlg, user):
-            # le bouton est reste ou revenu sur "Suivre" : TikTok a ignore le clic (limitation silencieuse)
-            fails += 1
-            skip.add(user)
-            log.info("[%s] abonnement a @%s non pris en compte (%d de suite)", seed, user, fails)
-            shot(page, cfg, f"follow-{user}")
-            if fails >= 3:
-                cfg["_block"] = "limit"
-                return done, "blocked"
-            continue
-        fails = 0
-        st.add_follow(user, seed, fixed_days())
-        done += 1
-        counter[0] += 1
-        log.info("[%s] abonne a @%s (%d/%d)", seed, user, done, quota)
-        human_pause(page, cfg, counter[0], "follow")
-    return done, "ok"
+            if not follow_registered(page, dlg, user):
+                # le bouton est reste ou revenu sur "Suivre" : TikTok a ignore le clic (limitation silencieuse)
+                fails += 1
+                skip.add(user)
+                log.info("[%s] abonnement a @%s non pris en compte (%d de suite)", seed, user, fails)
+                shot(page, cfg, f"follow-{user}")
+                if fails >= 3:
+                    cfg["_block"] = "limit"
+                    return done, "blocked"
+                continue
+            fails = 0
+            st.add_follow(user, seed, fixed_days())
+            done += 1
+            counter[0] += 1
+            recent.append(user)
+            log.info("[%s] abonne a @%s (%d/%d)", seed, user, done, quota)
+            if cfg["verify_every"] and len(recent) % cfg["verify_every"] == 0:
+                if verify_recent(page, st, cfg) == "blocked":
+                    return done, "blocked"
+            human_pause(page, cfg, counter[0], "follow")
+        return done, "ok"
+    finally:
+        if filtered:
+            log.info("[%s] %d pseudo(s) generique(s) ecarte(s) (follow-back mesure trop faible)", seed, filtered)
 
 
 def follow_registered(page, dlg, user):
@@ -952,6 +1073,95 @@ def follow_registered(page, dlg, user):
             return True
         page.wait_for_timeout(2000)
     return user not in dlg.get_by_role("button", name=FOLLOW_RE).evaluate_all(JS_USERS)
+
+
+def follow_sticks(page, user, cfg):
+    """Ouvre le profil de `user` dans un second onglet (la liste en cours reste ouverte). Retourne 'ok' si
+    l'abonnement y figure, 'lost' si le bouton est sur Suivre, 'blocked' si TikTok reagit, None si on ne
+    peut pas conclure."""
+    tab = page.context.new_page()
+    try:
+        open_profile(tab, user)
+        if blocked(tab, cfg):
+            shot(tab, cfg, "blocked-verify")
+            return "blocked"
+        if visible(tab.get_by_text(NOT_FOUND_RE)):
+            return None
+        state = profile_state(tab)
+        return None if state is None else ("ok" if state == "following" else "lost")
+    except Exception:  # sondage facultatif : une erreur de navigation ne doit pas arreter le passage
+        return None
+    finally:
+        try:
+            tab.close()
+            page.bring_to_front()
+        except Exception:
+            pass
+
+
+def verify_recent(page, st, cfg):
+    """Sondage contre la limitation silencieuse : le bouton de la liste peut afficher "Abonne" alors que
+    TikTok n'a rien enregistre. Un abonnement recent du passage (pas le dernier, laisse le temps a TikTok)
+    est verifie sur le profil du compte ; s'il a disparu, un second est verifie. Deux disparus = TikTok
+    ignore les abonnements : on s'arrete avant que la restriction ne s'aggrave. Retourne 'ok' ou 'blocked'."""
+    checked = cfg.setdefault("_checked", set())
+    pool = [u for u in cfg["_recent"][-cfg["verify_every"]:-1] if u not in checked]
+    random.shuffle(pool)
+    lost = 0
+    for user in pool[:2]:
+        checked.add(user)
+        res = follow_sticks(page, user, cfg)
+        if res == "blocked":
+            return "blocked"
+        if res != "lost":
+            return "ok"
+        lost += 1
+        st.mark_unfollowed(user, PHANTOM, action=False)
+        log.warning("Abonnement a @%s absent de son profil : TikTok ne l'a pas enregistre", user)
+    if lost >= 2:
+        log.warning("Deux abonnements recents ignores par TikTok : limitation silencieuse probable")
+        cfg["_block"] = "limit"
+        return "blocked"
+    return "ok"
+
+
+def follow_pass(page, st, cfg, counter, seeds, quota, fixed_days):
+    """Abonnements du passage, par tranches de follows_per_seed. Apres chaque tranche la source est tiree a
+    nouveau : la meme peut revenir, et sa liste rouverte montre alors ses abonnes les plus recents, en ligne
+    a cet instant (ils voient la notification tout de suite). Les tirages repartis sur plusieurs sources
+    font aussi apprendre plus vite laquelle rend le mieux. Une source epuisee ou inaccessible est ecartee
+    pour le passage, seeds_per_run fois au plus. Retourne (nombre, 'ok' | 'stop' | 'blocked')."""
+    remaining, follows, misses, out = quota, 0, 0, set()
+    wanted = handle_filter(st, cfg)
+    while remaining > 0 and misses < cfg["seeds_per_run"]:
+        pool = [s for s in seed_order(st, cfg, seeds) if s not in out]
+        if not pool:
+            break
+        seed = pool[0]
+        if cfg["seed_scoring"]:
+            a, b = seed_scores(st, cfg, [seed])[seed]
+            log.info("[%s] source choisie (follow-back estime %.1f %%)", seed, a / (a + b) * 100)
+        n, s = follow_from_seed(page, seed, min(remaining, cfg["follows_per_seed"] or remaining), st, cfg,
+                                counter, fixed_days, wanted)
+        follows += n
+        remaining -= n
+        if s == "skip":  # source inaccessible : ecartee apres 3 echecs
+            st.set_meta(f"seed_fail:{seed}", str(int(st.get_meta(f"seed_fail:{seed}") or 0) + 1))
+            out.add(seed)
+            misses += 1
+            continue
+        st.set_meta(f"seed_fail:{seed}", "0")
+        st.set_meta("last_seed", seed)
+        if s in ("blocked", "stop"):
+            return follows, s
+        if s == "dry":
+            st.set_meta(f"seed_dry_until:{seed}", (today() + timedelta(days=cfg["seed_dry_days"])).isoformat())
+            out.add(seed)
+            misses += 1
+            log.info("[%s] plus de compte a suivre : source suivante", seed)
+    if remaining > 0:
+        log.info("Quota non atteint : il manque %d abonnement(s)", remaining)
+    return follows, "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -1001,7 +1211,7 @@ def scan_my_followers(page, me, st, cfg):
 # Desabonnements
 # ---------------------------------------------------------------------------
 def unfollow_one(page, user, cfg):
-    """Retourne 'ok' | 'gone' | 'failed' | 'blocked'."""
+    """Retourne 'ok' | 'gone' | 'already' | 'failed' | 'blocked' ; 'already' = deja plus abonne."""
     open_profile(page, user)
     if blocked(page, cfg):
         return "blocked"
@@ -1009,7 +1219,7 @@ def unfollow_one(page, user, cfg):
         return "gone"
     state = profile_state(page)
     if state == "follow":
-        return "ok"  # deja plus abonne
+        return "already"
     if state is None:
         shot(page, cfg, f"unfollow-{user}-nobutton")
         return "failed"
@@ -1038,24 +1248,47 @@ def unfollow_one(page, user, cfg):
     return "failed"
 
 
-def unfollow_pass(page, st, cfg, counter, days):
-    """Retourne (nombre, 'ok' | 'stop' | 'blocked' | 'broken')."""
-    due = st.due(days, max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today()), cfg["keep_followbacks"])
+def unfollow_pass(page, st, cfg, counter, days, until=None):
+    """Desabonne les comptes arrives a echeance ; `until` : fin de la part du temps qui leur est reservee.
+    Retourne (nombre, 'ok' | 'later' | 'stop' | 'blocked' | 'broken')."""
+    due = st.due(days, max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today()), cfg["keep_followbacks"],
+                 cfg["followback_keep_days"])
     log.info("%d compte(s) a desabonner", len(due))
-    done = fails = 0
+    done = fails = phantoms = 0
+    since = st.get_meta("last_block_at") or ""  # les abonnements d'avant ont deja valu un blocage
     for user in due:
+        if until and now() >= until:
+            log.info("Part du temps reservee aux desabonnements utilisee : place aux abonnements")
+            return done, "later"
         if not throttle(page, st, cfg, "unfollow"):
             return done, "stop"
         res = unfollow_one(page, user, cfg)
         if res == "blocked":
             return done, "blocked"
-        if res in ("ok", "gone"):
-            st.mark_unfollowed(user, None if res == "ok" else "introuvable")
+        if res == "ok":
+            st.mark_unfollowed(user)
             done += 1
-            fails = 0
+            fails = phantoms = 0
             counter[0] += 1
-            log.info("desabonne de @%s%s", user, "" if res == "ok" else " (compte introuvable)")
+            log.info("desabonne de @%s", user)
             human_pause(page, cfg, counter[0], "unfollow")
+        elif res in ("gone", "already"):  # rien a cliquer : ni pause ni decompte dans les plafonds
+            st.mark_unfollowed(user, "introuvable" if res == "gone" else PHANTOM, action=False)
+            fails = 0
+            if res == "gone":
+                log.info("@%s introuvable : retire de la rotation", user)
+                continue
+            if st.followed_at(user) <= since:
+                log.info("@%s n'etait deja plus suivi (abonnement d'avant la derniere pause)", user)
+                continue
+            phantoms += 1
+            log.info("@%s n'etait deja plus suivi : abonnement non enregistre par TikTok ? (%d de suite)",
+                     user, phantoms)
+            if cfg["phantom_streak"] and phantoms >= cfg["phantom_streak"]:
+                log.warning("%d abonnements de suite absents : TikTok les a ignores sans message "
+                            "(limitation silencieuse probable)", phantoms)
+                cfg["_block"] = "limit"
+                return done, "blocked"
         else:
             fails += 1
             log.warning("echec du desabonnement de @%s (%d de suite)", user, fails)
@@ -1114,13 +1347,13 @@ def cmd_status(cfg):
     st = State(DB_PATH)
     base = cfg["unfollow_after_days"]
     days = int(st.get_meta("current_days") or base) if cfg["adaptive_delay"] else base
-    keep = cfg["keep_followbacks"]
+    keep, keep_days = cfg["keep_followbacks"], cfg["followback_keep_days"]
     stats = followback_stats(st.samples(cfg["adapt_window_days"]), cfg, base)
     factor = float(st.get_meta("quota_factor") or 1.0)
+    kept = st.count("unfollowed_on IS NULL AND followed_back_on IS NOT NULL")
     print(f"Abonnements en cours (faits par le script) : {st.count('unfollowed_on IS NULL')}"
-          + (f" dont {st.count('unfollowed_on IS NULL AND followed_back_on IS NOT NULL')} follow-back gardes"
-             if keep else ""))
-    print(f"A desabonner maintenant                    : {len(st.due(days, 10**6, keep))}")
+          + (f" dont {kept} follow-back gardes" + ("" if keep else f" ({keep_days} j au moins)") if kept else ""))
+    print(f"A desabonner maintenant                    : {len(st.due(days, 10**6, keep, keep_days))}")
     print(f"Abonnements aujourd'hui                    : {st.followed_today()} / {follow_budget(st, cfg)} autorises"
           f" (plafond {cfg['follows_per_day']}, coefficient {factor:.2f})")
     print(f"Total historique                           : {st.count()}")
@@ -1132,6 +1365,9 @@ def cmd_status(cfg):
     print(f"Sources                                    : {len(cfg['seeds'])} comptes ({cfg['seeds_source']}),"
           f" choix {'par taux de follow-back' if cfg['seed_scoring'] else 'en rotation'}")
     print(f"Pause anti-blocage jusqu'au                : {st.get_meta('blocked_until') or '-'}")
+    month = (today() - timedelta(days=30)).isoformat()
+    print(f"Abonnements ignores par TikTok (30 j)      : {st.count('note=? AND followed_on>=?', (PHANTOM, month))}"
+          " (limitation silencieuse : bouton revenu sur Suivre)")
     if is_rest_day(cfg, today()):
         print("Aujourd'hui                                : jour de repos")
     if st.get_meta("needs_attention"):
@@ -1147,6 +1383,22 @@ def cmd_status(cfg):
             flags = "" if s in cfg["seeds"] else "  (retiree de la liste)"
             print(f"  @{s:<30} {v['total']:>5} suivis  {v['fb']:>4} / {v['n']:<5} {raw}"
                   f"   estime {a / (a + b) * 100:4.1f} %{flags}")
+    rows = st.scored(cfg["seed_score_days"])
+    for title, key in (("type de pseudo", handle_kind), ("moment de l'abonnement", day_part)):
+        seg = segment_table(rows, key)
+        if len(seg) < 2:
+            continue
+        scores = beta_scores(seg, list(seg), cfg["seed_prior_strength"])
+        print(f"\nFollow-back par {title} (sous {cfg['seed_score_days']} j) :")
+        for g in sorted(seg, key=lambda g: -scores[g][0] / sum(scores[g])):
+            v, (a, b) = seg[g], scores[g]
+            print(f"  {g:<31} {v['fb']:>4} / {v['n']:<5} {v['fb'] / v['n'] * 100:5.1f} %"
+                  f"   estime {a / (a + b) * 100:4.1f} %")
+        if key is handle_kind:
+            n = min(seg.get(k, {"n": 0})["n"] for k in ("generique", "perso"))
+            print("  filtre des pseudos generiques : " + (
+                "desactive" if not cfg["handle_filter"] else "actif (ecartes si nettement moins rentables)"
+                if n >= cfg["handle_filter_min"] else f"en attente ({n} / {cfg['handle_filter_min']} mesures)"))
     return 0
 
 
@@ -1280,7 +1532,7 @@ def cmd_run(cfg, here, force=False):
             log.info("Jour de repos : rien a faire")
             return 0
     base = cfg["unfollow_after_days"]
-    keep = cfg["keep_followbacks"]
+    keep, keep_days = cfg["keep_followbacks"], cfg["followback_keep_days"]
     days = int(st.get_meta("current_days") or base) if cfg["adaptive_delay"] and cfg["username"] else base
     budget = follow_budget(st, cfg)
     quota = max(0, budget - st.followed_today())
@@ -1289,7 +1541,7 @@ def cmd_run(cfg, here, force=False):
                     "n'ont pas rattrape leur retard", cfg["max_following"])
         quota = 0
     room = max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today())
-    if not quota and not (room and st.due(days, 1, keep)):
+    if not quota and not (room and st.due(days, 1, keep, keep_days)):
         log.info("Rien a faire aujourd'hui (abonnements autorises : %d)", budget)
         return 0
     alive = [seed for seed in cfg["seeds"] if int(st.get_meta(f"seed_fail:{seed}") or 0) < 3]
@@ -1301,7 +1553,7 @@ def cmd_run(cfg, here, force=False):
         log.info("Temps de passage du jour deja utilise (%d min) : rien a faire", cfg["daily_minutes"])
         return 0
     cfg["_deadline"] = now() + timedelta(minutes=left) if left is not None else None
-    cfg["_block"] = None
+    cfg["_block"], cfg["_recent"], cfg["_checked"] = None, [], set()
     started = now()
     longest = max(cfg["unfollow_days_max"], base)
     counter = [0]
@@ -1344,37 +1596,23 @@ def cmd_run(cfg, here, force=False):
                         log.info("Delai de desabonnement ajuste : %d -> %d jours", days, stats["delay"])
                     days = stats["delay"]
                     st.set_meta("current_days", str(days))
-                if status == "ok" and room and st.due(days, 1, keep):
-                    unfollows, status = unfollow_pass(page, st, cfg, counter, days)
+
+                def unfollows_due():
+                    room = max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today())
+                    return bool(room and st.due(days, 1, keep, keep_days))
+
+                if status == "ok" and unfollows_due():
+                    unfollows, status = unfollow_pass(page, st, cfg, counter, days, unfollow_until(cfg, quota))
+                    # part du temps ecoulee, ou plafond horaire des desabonnements : les abonnements ont le leur
+                    if status in ("later", "stop") and not day_over(cfg):
+                        status = "ok"
                 if status == "ok" and quota:
-                    remaining = quota
-                    # une seule source par passage, utilisee jusqu'au quota ; la suivante n'est ouverte que
-                    # si celle-ci est epuisee ou inaccessible (seeds_per_run sources au plus)
-                    pool = seed_order(st, cfg, alive)
-                    scores = seed_scores(st, cfg, pool) if cfg["seed_scoring"] else {}
-                    for seed in pool[:cfg["seeds_per_run"]]:
-                        if seed in scores:
-                            a, b = scores[seed]
-                            log.info("[%s] source choisie (follow-back estime %.1f %%)", seed, a / (a + b) * 100)
-                        n, s = follow_from_seed(page, seed, remaining, st, cfg, counter, fixed_days)
-                        if s == "skip":  # source inaccessible : ecartee apres 3 echecs
-                            st.set_meta(f"seed_fail:{seed}", str(int(st.get_meta(f"seed_fail:{seed}") or 0) + 1))
-                            continue
-                        st.set_meta(f"seed_fail:{seed}", "0")
-                        st.set_meta("last_seed", seed)
-                        follows += n
-                        remaining -= n
-                        if s in ("blocked", "stop"):
-                            status = s
-                            break
-                        if remaining <= 0:
-                            break
-                        if s == "dry":
-                            st.set_meta(f"seed_dry_until:{seed}",
-                                        (today() + timedelta(days=cfg["seed_dry_days"])).isoformat())
-                        log.info("[%s] plus de compte a suivre : source suivante", seed)
-                    if status == "ok" and remaining > 0:
-                        log.info("Quota non atteint : il manque %d abonnement(s)", remaining)
+                    follows, status = follow_pass(page, st, cfg, counter, alive, quota, fixed_days)
+                    if status == "stop" and not day_over(cfg):
+                        status = "ok"
+                if status == "ok" and unfollows_due():  # temps restant apres les abonnements
+                    n, status = unfollow_pass(page, st, cfg, counter, days)
+                    unfollows += n
             finally:
                 try:
                     ctx.close()
