@@ -198,6 +198,9 @@ def test_rotation(env, capsys):
     tr.cmd_run(cfg_for(follows_per_day=0, unfollow_after_days=0, **no_scan), here=True, force=True)
     assert not tr.State(tr.DB_PATH).get_meta("blocked_until") and mock.following == {"u0", "u1", "u2"}
     tr.cmd_run(cfg_for(follows_per_day=0, unfollow_after_days=0, **no_scan), here=True, force=True)
+    assert not users("note = 'refus'")  # meme jour : un ennui par jour au plus
+    day[0] += timedelta(days=1)  # 3e jour de refus, les desabonnements marchent (z0 hier) : abandonnes
+    tr.cmd_run(cfg_for(follows_per_day=0, unfollow_after_days=0, **no_scan), here=True, force=True)
     assert users("note = 'refus' AND unfollowed_at IS NULL") == {"u0", "u1", "u2"}
     assert not tr.State(tr.DB_PATH).get_meta("blocked_until")
 
@@ -245,3 +248,53 @@ def test_sessions(env, monkeypatch):
     assert len(users()) == 30
     seen = json.loads(tr.State(tr.DB_PATH).get_meta("parts_seen"))
     assert seen[day[0].isoformat()] == [p[0] for p in tr.DAY_PARTS]
+
+    # jour suivant, source epuisee : la session du matin le note, le reveil suivant ne relance pas Edge
+    day[0] += timedelta(days=1)
+    mock.followers["seeda"] = mock.followers["seeda"][:30]
+    windows = tr.part_windows(cfg, day[0])
+    st.set_meta("part_draw", json.dumps({"day": day[0].isoformat(), "draw": draw}))
+    moment[0] = windows[0][2] + timedelta(minutes=1)
+    launched.clear()
+    tr.cmd_run(cfg, here=True, auto=True)
+    assert launched and len(users()) == 30
+    launched.clear()
+    moment[0] += timedelta(minutes=20)
+    assert tr.cmd_run(cfg, here=True, auto=True) == 0 and not launched
+
+    # deconnecte : un essai, puis plus de lancement d'Edge de la journee
+    monkeypatch.setattr(tr, "logged_in", lambda page: False)
+    moment[0] = windows[2][2] + timedelta(minutes=1)  # soir : derniere session, il reste des abonnements
+    assert tr.cmd_run(cfg, here=True, auto=True) == 3 and launched
+    launched.clear()
+    moment[0] += timedelta(minutes=20)
+    assert tr.cmd_run(cfg, here=True, auto=True) == 3 and not launched
+
+
+def test_tiktok_says_ignores_texts_written_by_users():
+    exe = chromium_path()
+    if not exe:
+        pytest.skip("Chromium indisponible")
+    from playwright.sync_api import sync_playwright
+    nav = '<header><a data-e2e="nav-profile" href="/@me">me</a></header>'
+    rows = '<li><a href="/@x">x</a><span>too fast racing</span></li><li><a href="/@y">y</a></li>'
+    cases = [
+        (nav + '<main><h1 data-e2e="user-title">u</h1></main><div>Too many attempts. Try again later.</div>', True),
+        (nav + '<main><h2 data-e2e="user-bio">Life moves too fast</h2></main>', False),
+        (nav + f'<div role="dialog"><ul>{rows}</ul></div>', False),
+        (nav + f'<div role="dialog"><ul>{rows}</ul><div>Try again later</div></div>', True),
+        (nav + '<main><a href="/@o/video/1">v</a><a href="/@o/video/2">v</a><p>Try again later</p></main>', False),
+        (nav + '<main><a href="/@o/video/1">v</a></main><div class="toast">Trop de tentatives</div>', True),
+    ]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(executable_path=exe, headless=True)
+        page = browser.new_page()
+        for html, expected in cases:
+            page.set_content(html)
+            assert tr.tiktok_says(page, tr.BLOCK_RE) is expected, html
+        page.set_content(nav + '<main><h2 data-e2e="user-bio">Couldn\'t find this account</h2>'
+                         '<h1 data-e2e="user-title">u</h1></main>')
+        assert not tr.account_missing(page)
+        page.set_content(nav + "<main><p>Couldn't find this account</p></main>")
+        assert tr.account_missing(page)
+        browser.close()

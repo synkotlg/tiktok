@@ -280,6 +280,47 @@ def test_reactions_ignore_profile_texts():
     assert tr.PROFILE_TEXT_SEL and "user-bio" in tr.PROFILE_TEXT_SEL
 
 
+class FakePage:
+    def wait_for_timeout(self, ms):
+        pass
+
+
+def test_broken_unfollows_are_never_abandoned(st, monkeypatch):
+    """Interface cassee (tous les desabonnements en echec) : 'broken' chaque jour, aucun compte abandonne ; une
+    fois reparee, tout est desabonne."""
+    day = [TODAY]
+    monkeypatch.setattr(tr, "today", lambda: day[0])
+    monkeypatch.setattr(tr, "human_pause", lambda *a: None)
+    monkeypatch.setattr(tr, "unfollow_one", lambda *a, **k: "failed")
+    cfg = dict(tr.DEFAULTS, max_unfollows_per_hour=10**6, active_hours=[0, 24])
+    for i in range(5):
+        add(st, f"u{i}", 10)
+    for _ in range(8):
+        cfg["_tried"] = set()
+        assert tr.unfollow_pass(FakePage(), st, cfg, [0], 4)[1] == "broken"
+        day[0] += timedelta(days=1)
+    assert st.count("unfollowed_on IS NULL") == 5
+    monkeypatch.setattr(tr, "unfollow_one", lambda *a, **k: "ok")
+    cfg["_tried"] = set()
+    assert tr.unfollow_pass(FakePage(), st, cfg, [0], 4) == (5, "ok")
+
+
+def test_unfollow_refused_by_one_account_only(st, monkeypatch):
+    """Un compte que TikTok refuse alors que les autres passent : pas de serie, abandonne apres 3 jours."""
+    day = [TODAY]
+    monkeypatch.setattr(tr, "today", lambda: day[0])
+    monkeypatch.setattr(tr, "human_pause", lambda *a: None)
+    monkeypatch.setattr(tr, "unfollow_one", lambda page, user, *a, **k: "refused" if user == "bad" else "ok")
+    cfg = dict(tr.DEFAULTS, max_unfollows_per_hour=10**6, active_hours=[0, 24])
+    for d in range(3):
+        add(st, "bad" if d == 0 else f"ok{d}", 10)
+        add(st, f"x{d}", 10)
+        cfg["_tried"] = set()
+        assert tr.unfollow_pass(FakePage(), st, cfg, [0], 4)[1] == "ok"
+        day[0] += timedelta(days=1)
+    assert st.db.execute("SELECT note FROM users WHERE username='bad'").fetchone() == ("refus",)
+
+
 def test_rest_days_never_consecutive():
     cfg = dict(tr.DEFAULTS, rest_day_chance=0.5)
     days = [TODAY + timedelta(days=i) for i in range(730)]
@@ -294,9 +335,30 @@ def test_block_policy_and_recovery(st, monkeypatch):
     assert tr.register_block(st, cfg, "warning")[1] == 0.25
     tr.register_clean_day(st)  # meme jour que le blocage : pas de remontee
     assert st.get_meta("quota_factor") == "0.25"
-    monkeypatch.setattr(tr, "today", lambda: TODAY + timedelta(days=1))
-    tr.register_clean_day(st)
+    day = [TODAY + timedelta(days=1)]
+    monkeypatch.setattr(tr, "today", lambda: day[0])
+    tr.settle_clean_day(st)
+    tr.register_clean_day(st)  # passage propre : le jour ne compte qu'une fois fini
+    tr.settle_clean_day(st)
+    assert st.get_meta("quota_factor") == "0.25"
+    day[0] += timedelta(days=1)
+    tr.settle_clean_day(st)
     assert st.get_meta("quota_factor") == "0.35"
+    tr.register_clean_day(st)  # session du matin propre...
+    tr.register_block(st, cfg, "captcha")  # ...blocage le soir : pas de credit pour ce jour
+    day[0] += timedelta(days=1)
+    tr.settle_clean_day(st)
+    assert st.get_meta("quota_factor") == "0.26"
+
+
+def test_unfollow_trouble_counts_once_per_day(st, monkeypatch):
+    day = [TODAY]
+    monkeypatch.setattr(tr, "today", lambda: day[0])
+    assert tr.bump_trouble(st, "x") == (1, True)
+    assert tr.bump_trouble(st, "x") == (1, False)  # meme jour : pas de nouvel ennui
+    day[0] += timedelta(days=1)
+    assert tr.bump_trouble(st, "x") == (2, False)
+    assert tr.unfollow_trouble(st, "x") == (2, day[0].isoformat())
 
 
 def test_follow_budget_ramps_up(st):

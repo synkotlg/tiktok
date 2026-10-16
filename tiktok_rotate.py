@@ -118,15 +118,18 @@ JS_HREF_USERS = r"""els => els.map(a => {
   return m ? m[1].toLowerCase() : null;
 })"""
 
-# Parmi des elements dont le texte ressemble a une reaction de TikTok, nombre de ceux qui n'en sont pas
-# ecrits par un utilisateur : hors PROFILE_TEXT_SEL, et hors ligne de liste ou carte de compte (premier
-# ancetre qui contient des liens de profil : un seul lien distinct = la ligne d'un compte). Un message de
-# TikTok (toast, fenetre) n'est dans aucune ligne.
-JS_OUTSIDE_PROFILES = r"""(els, skip) => els.filter(el => {
-  if (el.closest(skip)) return false;
-  let n = el;
-  for (let i = 0; i < 8 && n; i++, n = n.parentElement) {
-    const k = new Set([...n.querySelectorAll('a[href*="/@"]')].map(a => a.getAttribute('href'))).size;
+# Parmi des elements dont le texte ressemble a une reaction de TikTok, nombre de ceux qui ne sont pas ecrits
+# par un utilisateur : hors PROFILE_TEXT_SEL, et hors ligne de liste ou carte de compte (premier ancetre qui
+# contient des liens de profil, ton lien de menu exclu : un seul compte = sa ligne). Un message de TikTok
+# (toast, fenetre) n'est dans aucune ligne : on remonte jusqu'a la page ou la fenetre.
+JS_OUTSIDE_PROFILES = r"""(els, args) => els.filter(el => {
+  if (el.closest(args.skip)) return false;
+  const user = a => { const m = (a.getAttribute('href') || '').match(/\/@([\w.]+)/); return m ? m[1].toLowerCase() : null; };
+  for (let n = el, i = 0; i < 8 && n; i++, n = n.parentElement) {
+    // page ou fenetre entiere (le lien vers ton profil n'est dans aucune ligne) : message de TikTok
+    if (n === document.body || n.matches(args.dialog) || n.querySelector(args.nav)) return true;
+    const links = [...n.querySelectorAll('a[href*="/@"]')].filter(a => !a.matches(args.nav));
+    const k = new Set(links.map(user).filter(Boolean)).size;  // /@u et /@u/video/1 : un seul compte
     if (k === 1) return false;
     if (k > 1) return true;
   }
@@ -372,7 +375,8 @@ class State:
         """Jours des `window_days` derniers (avant aujourd'hui) ou des abonnements ont ete faits : sert a la
         montee en charge."""
         return self.db.execute(
-            "SELECT COUNT(DISTINCT followed_on) FROM users WHERE followed_on < ? AND followed_on >= ?",
+            "SELECT COUNT(DISTINCT followed_on) FROM users WHERE followed_on < ? AND followed_on >= ? AND "
+            + REAL_FOLLOW,
             (today().isoformat(), (today() - timedelta(days=window_days)).isoformat())).fetchone()[0]
 
     def actions_since(self, kind, since):
@@ -455,11 +459,6 @@ class State:
     def del_meta(self, key):
         self.db.execute("DELETE FROM meta WHERE key=?", (key,))
         self.db.commit()
-
-    def bump_meta(self, key):
-        n = int(self.get_meta(key) or 0) + 1
-        self.set_meta(key, str(n))
-        return n
 
 
 def km_cdf(samples, horizon):
@@ -656,10 +655,23 @@ def register_block(st, cfg, kind):
 
 
 def register_clean_day(st):
-    """Un jour sans reaction de TikTok : les quotas remontent de 10 points, jusqu'a 100 %."""
-    if st.get_meta("last_clean_on") == today().isoformat():
+    """Passage sans reaction de TikTok : le jour est candidat. Il ne compte qu'une fois fini (settle_clean_day),
+    sans blocage entre-temps : avec plusieurs sessions par jour, la premiere ne doit pas relever les quotas
+    des suivantes."""
+    if st.get_meta("last_clean_on") != today().isoformat():
+        st.set_meta("clean_candidate", today().isoformat())
+
+
+def settle_clean_day(st):
+    """Un jour fini sans reaction de TikTok : les quotas remontent de 10 points, jusqu'a 100 %. Un blocage ce
+    jour-la (register_block met last_clean_on a la date du blocage) annule le credit."""
+    day = st.get_meta("clean_candidate")
+    if not day or day >= today().isoformat():
         return
-    st.set_meta("last_clean_on", today().isoformat())
+    st.del_meta("clean_candidate")
+    if day == st.get_meta("last_clean_on"):
+        return
+    st.set_meta("last_clean_on", day)
     factor = min(1.0, float(st.get_meta("quota_factor") or 1.0) + 0.1)
     st.set_meta("quota_factor", f"{factor:.2f}")
     if factor >= 1.0:
@@ -679,7 +691,9 @@ def add_run_time(st, cfg):
     Releve avant chaque action (throttle) et en fin de passage : un PC eteint en pleine session ne fait pas
     perdre le decompte."""
     moment = now()
-    secs = (moment - cfg["_tick"]).total_seconds()
+    # entre deux releves, au plus l'attente la plus longue prevue (plafond horaire) : au-dela, le PC etait en
+    # veille (couvercle ferme), ce temps ne compte pas
+    secs = min((moment - cfg["_tick"]).total_seconds(), (cfg["max_wait_minutes"] + 15) * 60)
     cfg["_tick"] = moment
     day = today().isoformat()
     for key in (f"run_seconds:{day}", f"run_seconds:{day}:{cfg['_part']}"):
@@ -878,9 +892,9 @@ def acquire_lock():
     if LOCK.exists():
         try:
             pid = int(LOCK.read_text().strip())
-            if pid != os.getpid() and psutil.pid_exists(pid):
+            if pid != os.getpid() and "tiktok_rotate" in " ".join(psutil.Process(pid).cmdline()):
                 return False
-        except ValueError:
+        except (ValueError, psutil.Error):  # verrou illisible, processus fini ou autre programme : on le reprend
             pass
     LOCK.write_text(str(os.getpid()))
     atexit.register(lambda: LOCK.unlink(missing_ok=True))
@@ -1014,7 +1028,8 @@ def tiktok_says(page, rx):
     """True si un texte visible correspond a `rx` hors des textes ecrits par des utilisateurs (voir
     JS_OUTSIDE_PROFILES)."""
     try:
-        return page.get_by_text(rx).filter(visible=True).evaluate_all(JS_OUTSIDE_PROFILES, PROFILE_TEXT_SEL) > 0
+        return page.get_by_text(rx).filter(visible=True).evaluate_all(
+            JS_OUTSIDE_PROFILES, {"skip": PROFILE_TEXT_SEL, "dialog": DIALOG_SEL, "nav": NAV_PROFILE_SEL}) > 0
     except Exception:
         return False
 
@@ -1460,8 +1475,10 @@ def follow_pass(page, st, cfg, counter, seeds, quota, fixed_days):
         remaining -= n
         if n and cfg["verify_every"] and s in ("ok", "dry") and verify_recent(page, st, cfg, n) == "blocked":
             s = "blocked"
-        if s == "skip":  # source inaccessible : ecartee apres 3 echecs
-            st.set_meta(f"seed_fail:{seed}", str(int(st.get_meta(f"seed_fail:{seed}") or 0) + 1))
+        if s == "skip":  # source inaccessible : ecartee apres 3 echecs, un par jour au plus
+            if st.get_meta(f"seed_fail_on:{seed}") != today().isoformat():
+                st.set_meta(f"seed_fail_on:{seed}", today().isoformat())
+                st.set_meta(f"seed_fail:{seed}", str(int(st.get_meta(f"seed_fail:{seed}") or 0) + 1))
             out.add(seed)
             misses += 1
             continue
@@ -1582,28 +1599,49 @@ def unfollow_one(page, user, st, cfg, spare_friends=False):
     return "failed"
 
 
+def unfollow_trouble(st, user):
+    """(jours d'ennui, date du dernier) d'un desabonnement en echec ou refuse."""
+    raw = st.get_meta(f"unfollow_trouble:{user}") or ""
+    day, _, n = raw.rpartition(":")
+    return (int(n) if n.isdigit() else 0), day
+
+
+def bump_trouble(st, user):
+    """Un ennui de plus pour `user`, au plus un par jour (les reveils frequents ne doivent pas l'abandonner en
+    quelques heures). Retourne (jours d'ennui, premier ennui ?)."""
+    n, day = unfollow_trouble(st, user)
+    if day != today().isoformat():
+        st.set_meta(f"unfollow_trouble:{user}", f"{today().isoformat()}:{n + 1}")
+        return n + 1, n == 0
+    return n, False
+
+
 def unfollow_pass(page, st, cfg, counter, days, until=None):
     """Desabonne les comptes arrives a echeance ; `until` : fin de la part du temps qui leur est reservee.
-    Un compte deja en echec ou refuse passe en dernier, et seul son premier ennui compte dans les series
-    (sinon les memes comptes en tete de file bloqueraient chaque passage). Refuse 3 fois : abandonne (il
-    reste suivi). Retourne (nombre, 'ok' | 'later' | 'stop' | 'blocked' | 'broken')."""
-    due = st.due(days, max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today()), cfg["keep_followbacks"],
-                 cfg["followback_keep_days"])
 
-    def trouble(user):
-        return int(st.get_meta(f"unfollow_trouble:{user}") or 0)
-    due.sort(key=lambda u: trouble(u) > 0)
+    Echecs et refus : un compte deja en difficulte passe en dernier, et son compteur monte au plus une fois
+    par jour. Si les desabonnements marchent (un a reussi dans ce passage, ou depuis hier), l'ennui d'un
+    compte deja en difficulte lui est propre : il ne compte pas dans les series, et apres 3 jours de refus
+    (5 d'echec) le compte est abandonne (il reste suivi). Sinon tout compte : 3 echecs = interface modifiee
+    ('broken'), 3 refus = limitation. Un compte n'est essaye qu'une fois par passage.
+    Retourne (nombre, 'ok' | 'later' | 'stop' | 'blocked' | 'broken')."""
+    tried = cfg.setdefault("_tried", set())
+    due = [u for u in st.due(days, max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today()),
+                             cfg["keep_followbacks"], cfg["followback_keep_days"]) if u not in tried]
+    due.sort(key=lambda u: unfollow_trouble(st, u)[0] > 0)
     log.info("%d compte(s) a desabonner", len(due))
     done = fails = phantoms = refused = 0
     # les abonnements d'avant le dernier blocage l'ont deja provoque (bases anciennes : fin de la pause)
     since = st.get_meta("last_block_at") or st.get_meta("blocked_until") or ""
     spare = cfg["keep_followbacks"] or cfg["followback_keep_days"] > 0
+    yesterday = (today() - timedelta(days=1)).isoformat()
     for user in due:
         if until and now() >= until:
             log.info("Part du temps reservee aux desabonnements utilisee : place aux abonnements")
             return done, "later"
         if not throttle(page, st, cfg, "unfollow"):
             return done, "stop"
+        tried.add(user)
         # un follow-back deja connu n'arrive ici qu'une fois sa periode de grace passee
         res = unfollow_one(page, user, st, cfg, spare_friends=spare and not st.followed_back(user))
         if res == "blocked":
@@ -1611,22 +1649,11 @@ def unfollow_pass(page, st, cfg, counter, days, until=None):
         if res == "friend":
             log.info("@%s te suit en retour (absent de la lecture de tes abonnes) : garde", user)
             continue
-        if res == "refused":
-            n = st.bump_meta(f"unfollow_trouble:{user}")
-            if n >= 3:
-                st.mark_unfollowed(user, "refus", action=False)
-                log.warning("@%s : desabonnement refuse %d fois, abandonne (reste suivi)", user, n)
-            if n == 1:
-                refused += 1
-                if refused >= 3:
-                    log.warning("3 desabonnements de suite refuses par TikTok : limitation probable")
-                    cfg["_block"] = "limit"
-                    return done, "blocked"
-            human_pause(page, cfg, counter[0], "unfollow")
-            continue
         if res == "ok":
-            if trouble(user):
+            if unfollow_trouble(st, user)[0]:
                 st.del_meta(f"unfollow_trouble:{user}")
+            if not done:
+                st.set_meta("last_unfollow_ok_on", today().isoformat())
             st.mark_unfollowed(user)
             done += 1
             fails = phantoms = refused = 0
@@ -1635,15 +1662,18 @@ def unfollow_pass(page, st, cfg, counter, days, until=None):
             human_pause(page, cfg, counter[0], "unfollow")
         elif res in ("gone", "already"):  # rien a cliquer : ni pause ni decompte dans les plafonds
             fan = st.followed_back(user)  # il a suivi en retour : TikTok avait bien enregistre l'abonnement
-            st.mark_unfollowed(user, "introuvable" if res == "gone" else "deja desabonne" if fan else PHANTOM,
+            ours = unfollow_trouble(st, user)[0] > 0  # un essai precedent "en echec" etait en fait passe
+            if ours:
+                st.del_meta(f"unfollow_trouble:{user}")
+            st.mark_unfollowed(user, "introuvable" if res == "gone" else "deja desabonne" if fan or ours else PHANTOM,
                                action=False)
             fails = 0
             if res == "gone":
                 log.info("@%s introuvable : retire de la rotation", user)
                 continue
-            if fan or st.followed_at(user) <= since:
-                log.info("@%s n'etait deja plus suivi (%s)", user,
-                         "il t'a suivi en retour" if fan else "abonnement d'avant la derniere pause")
+            if fan or ours or st.followed_at(user) <= since:
+                log.info("@%s n'etait deja plus suivi (%s)", user, "il t'a suivi en retour" if fan else
+                         "desabonnement precedent passe" if ours else "abonnement d'avant la derniere pause")
                 continue
             phantoms += 1
             log.info("@%s n'etait deja plus suivi : abonnement non enregistre par TikTok ? (%d de suite)",
@@ -1653,19 +1683,27 @@ def unfollow_pass(page, st, cfg, counter, days, until=None):
                             "(limitation silencieuse probable)", phantoms)
                 cfg["_block"] = "limit"
                 return done, "blocked"
-        else:
-            n = st.bump_meta(f"unfollow_trouble:{user}")
-            if n >= 5:
-                st.mark_unfollowed(user, "echec", action=False)
-                log.warning("@%s : desabonnement en echec %d fois, abandonne (reste suivi)", user, n)
-            if n > 1:  # deja en echec avant : ne dit rien de l'interface
-                continue
-            fails += 1
-            log.warning("echec du desabonnement de @%s (%d de suite)", user, fails)
-            if fails >= 3:
-                log.warning("3 echecs de suite : interface modifiee ? lance 'tiktok_rotate.py diagnose', "
-                            "voir data/debug et la skill maj-selecteurs")
-                return done, "broken"
+        else:  # 'refused' ou 'failed'
+            n, first = bump_trouble(st, user)
+            own = not first and (done > 0 or (st.get_meta("last_unfollow_ok_on") or "") >= yesterday)
+            if own and n >= (3 if res == "refused" else 5):
+                st.mark_unfollowed(user, "refus" if res == "refused" else "echec", action=False)
+                log.warning("@%s : desabonnement %s %d jours, abandonne (reste suivi)", user,
+                            "refuse" if res == "refused" else "en echec", n)
+            if not own and res == "refused":
+                refused += 1
+                if refused >= 3:
+                    log.warning("3 desabonnements de suite refuses par TikTok : limitation probable")
+                    cfg["_block"] = "limit"
+                    return done, "blocked"
+            elif not own:
+                fails += 1
+                log.warning("echec du desabonnement de @%s (%d de suite)", user, fails)
+                if fails >= 3:
+                    log.warning("3 echecs de suite : interface modifiee ? lance 'tiktok_rotate.py diagnose', "
+                                "voir data/debug et la skill maj-selecteurs")
+                    return done, "broken"
+            human_pause(page, cfg, counter[0], "unfollow")  # une page a ete ouverte, souvent un clic
     return done, "ok"
 
 
@@ -1703,6 +1741,7 @@ def cmd_login(cfg):
         if ok:
             st = State(DB_PATH)
             st.set_meta("needs_attention", "")
+            st.set_meta("logged_out_on", "")
             remember_username(page, cfg)
             if not cfg["username"]:
                 name = input("Ton pseudo TikTok, sans @ (sert a mesurer les follow-back) : ").strip().lstrip("@").lower()
@@ -1715,6 +1754,7 @@ def cmd_login(cfg):
 
 def cmd_status(cfg):
     st = State(DB_PATH)
+    settle_clean_day(st)
     base = cfg["unfollow_after_days"]
     days = int(st.get_meta("current_days") or base) if cfg["adaptive_delay"] else base
     keep, keep_days = cfg["keep_followbacks"], cfg["followback_keep_days"]
@@ -1898,6 +1938,12 @@ def cmd_diagnose(cfg):
     return 0
 
 
+def idle_parts(st):
+    """Parties du jour dont la session a epuise ses sources (pas de relance a chaque reveil)."""
+    day, *parts = (st.get_meta("session_idle") or "").split("|")
+    return parts if day == today().isoformat() else []
+
+
 def sessions_planned(st, auto):
     """Sessions par partie de journee : en reveil automatique, ou si la tache des reveils existe (vue ces 3
     derniers jours). Sinon (ancienne tache quotidienne), un passage utilise tout le temps restant du jour."""
@@ -1926,11 +1972,15 @@ def cmd_run(cfg, here, force=False, auto=False):
             st.set_meta("said", "|".join(said + [mark]))
         log.log(level, msg, *args)
 
+    settle_clean_day(st)
     attention = st.get_meta("needs_attention")
     if attention:
         say("attention", "Intervention requise (%s) : regle le probleme a la main dans TikTok, puis lance "
             "'tiktok_rotate.py login'", attention, level=logging.ERROR)
         return 5
+    if auto and st.get_meta("logged_out_on") == today().isoformat():  # un essai par jour suffit
+        say("deconnecte", "Session TikTok absente ou expiree : relance 'tiktok_rotate.py login'", level=logging.ERROR)
+        return 3
     until = st.get_meta("blocked_until")
     if until and moment < datetime.fromisoformat(until):
         say("pause", "Pause anti-blocage jusqu'au %s : rien a faire", until)
@@ -1952,10 +2002,18 @@ def cmd_run(cfg, here, force=False, auto=False):
     budget = follow_budget(st, cfg)
     quota = max(0, budget - st.followed_today())
     if st.following(keep) >= cfg["max_following"]:
-        log.warning("%d comptes suivis par le script : pas de nouvel abonnement tant que les desabonnements "
-                    "n'ont pas rattrape leur retard", cfg["max_following"])
+        say("max_following", "%d comptes suivis par le script : pas de nouvel abonnement tant que les "
+            "desabonnements n'ont pas rattrape leur retard", cfg["max_following"], level=logging.WARNING)
         quota = 0
-    room = max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today())
+
+    def unfollow_room():  # desabonnements encore permis aujourd'hui (aucun si l'interface a casse ce jour)
+        if st.get_meta("unfollow_broken_on") == today().isoformat():
+            return 0
+        return max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today())
+    room = unfollow_room()
+    if not room and st.get_meta("unfollow_broken_on") == today().isoformat():
+        say("casse", "Desabonnements en echec aujourd'hui (interface modifiee ?) : abonnements seulement "
+            "jusqu'a demain ; lance 'tiktok_rotate.py diagnose'", level=logging.WARNING)
     if not quota and not (room and st.due(days, 1, keep, keep_days)):
         say("rien", "Rien a faire aujourd'hui (abonnements autorises : %d)", budget)
         return 0
@@ -1977,6 +2035,9 @@ def cmd_run(cfg, here, force=False, auto=False):
         if auto and moment < start:
             say(f"attente:{name}", "Session %s prevue vers %s", name, f"{start:%H:%M}")
             return 0
+        if name in idle_parts(st):
+            say(f"vide:{name}", "Session %s : sources epuisees, reprise a la session suivante", name)
+            return 0
         minutes, quota, ushare = session_plan(st, cfg, windows, cur, moment, quota,
                                               len(st.due(days, room, keep, keep_days)) if room else 0)
         nxt = next((w for w in windows if w[1] >= end), None)
@@ -1993,6 +2054,7 @@ def cmd_run(cfg, here, force=False, auto=False):
                  name, left, quota, ushare * 100)
     cfg["_deadline"] = now() + timedelta(minutes=left) if left is not None else None
     cfg["_block"], cfg["_recent"], cfg["_checked"], cfg["_skip"], cfg["_attempts"] = None, [], set(), set(), []
+    cfg["_tried"] = set()
     cfg["_slow"], cfg["_tick"], cfg["_part"] = 1.0, now(), part
     longest = max(cfg["unfollow_days_max"], base)
     counter = [0]
@@ -2010,6 +2072,7 @@ def cmd_run(cfg, here, force=False, auto=False):
                 page.set_default_timeout(15000)
                 watch_api(page, cfg)
                 if not logged_in(page):
+                    st.set_meta("logged_out_on", today().isoformat())
                     log.error("Session TikTok absente ou expiree : relance 'tiktok_rotate.py login'")
                     return 3
                 remember_username(page, cfg)
@@ -2038,13 +2101,15 @@ def cmd_run(cfg, here, force=False, auto=False):
                     st.set_meta("current_days", str(days))
 
                 def unfollows_due():
-                    room = max(0, cfg["max_unfollows_per_day"] - st.unfollowed_today())
-                    return bool(room and st.due(days, 1, keep, keep_days))
+                    return bool(unfollow_room() and st.due(days, 1, keep, keep_days))
 
                 if status == "ok" and unfollows_due():
                     t0 = now()
                     unfollows, status = unfollow_pass(page, st, cfg, counter, days, unfollow_until(cfg, quota))
                     learn_seconds(st, cfg, "unfollow", (now() - t0).total_seconds(), unfollows)
+                    if status == "broken":  # plus de desabonnement aujourd'hui ; les abonnements continuent
+                        st.set_meta("unfollow_broken_on", today().isoformat())
+                        status = "ok"
                     # part du temps ecoulee, ou plafond horaire des desabonnements : les abonnements ont le leur
                     if status in ("later", "stop") and not day_over(cfg):
                         status = "ok"
@@ -2052,6 +2117,8 @@ def cmd_run(cfg, here, force=False, auto=False):
                     t0 = now()
                     follows, status = follow_pass(page, st, cfg, counter, alive, quota, fixed_days)
                     learn_seconds(st, cfg, "follow", (now() - t0).total_seconds(), follows)
+                    if plan and status == "ok" and follows < quota:  # sources epuisees : pas de relance
+                        st.set_meta("session_idle", "|".join([today().isoformat()] + idle_parts(st) + [part]))
                     if status == "stop" and not day_over(cfg):
                         status = "ok"
                 if status == "ok" and unfollows_due():  # temps restant apres les abonnements
@@ -2059,6 +2126,9 @@ def cmd_run(cfg, here, force=False, auto=False):
                     n, status = unfollow_pass(page, st, cfg, counter, days)
                     learn_seconds(st, cfg, "unfollow", (now() - t0).total_seconds(), n)
                     unfollows += n
+                    if status == "broken":
+                        st.set_meta("unfollow_broken_on", today().isoformat())
+                        status = "ok"
             finally:
                 try:
                     ctx.close()

@@ -135,9 +135,18 @@ vaut blocage immediat ; un refus sans message compte comme un abonnement non pri
 blocage), meme si le bouton affiche "Abonne". Si cette reponse n'est jamais vue (adresse changee), le
 journal le signale et le controle se fait par le bouton seul, comme avant.
 
-**Desabonnements refuses ou en echec** : le compte passe en fin de file et seul son premier ennui compte
-dans les series (3 refus de comptes differents = pause). Refuse 3 fois : abandonne (il reste suivi), pour
-qu'un meme compte en tete de file ne bloque pas chaque passage.
+**Desabonnements refuses ou en echec** : le compte passe en fin de file, et son compteur monte au plus une
+fois par jour. Si les desabonnements marchent pour les autres comptes, son ennui lui est propre : il ne
+compte pas dans les series, et apres 3 jours de refus (5 d'echec) le compte est abandonne (il reste suivi).
+Sinon, tout compte : 3 refus = pause ; 3 echecs = interface modifiee, plus de desabonnement jusqu'au
+lendemain (les abonnements continuent ; lance `diagnose`). Ainsi un meme compte en tete de file ne bloque
+pas chaque passage, et une interface cassee n'entraine aucun abandon.
+
+**Session TikTok expiree** : un essai, puis plus aucun lancement d'Edge de la journee (un message par jour
+dans le journal) jusqu'a `login`.
+
+**Credit d'un jour propre** (+10 points de quotas apres une pause) : compte une fois le jour fini, sans
+reaction de TikTok dans aucune de ses sessions.
 
 **Textes des profils** : une bio ou un nom qui contient "trop rapidement", "Try again later" ou "Ce compte
 est introuvable" n'est pas pris pour un message de TikTok (seuls comptent les textes hors bio, nom et
@@ -193,7 +202,9 @@ Au lieu d'un bloc de 3 h, le script fait une session par partie de la journee da
   bonne garde sa chance d'etre mesuree.
 - **Reveils** : la tache tourne toutes les 20 min ; un reveil hors session ne fait rien (et ne le note
   qu'une fois par jour dans le journal). Une session coupee (PC eteint) reprend au reveil suivant dans la
-  meme partie, avec ce qui lui reste : le temps est releve avant chaque action.
+  meme partie, avec ce qui lui reste : le temps est releve avant chaque action (un PC en veille, couvercle
+  ferme, ne consomme pas la journee). Une session dont les sources sont epuisees n'est pas relancee avant
+  la partie suivante ; une source inaccessible ne prend qu'un echec par jour (3 jours pour l'ecarter).
 
 `status` affiche les sessions du jour : debut prevu, minutes utilisees, abonnements, tirage du jour, et
 combien de jours le PC etait allume a ce moment. `run` lance a la main fait la session en cours ;

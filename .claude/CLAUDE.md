@@ -44,7 +44,10 @@ Cible : Windows, Edge via Playwright (profil persistant dans `data/profile`), ta
 - Textes de TikTok cherches dans la page : `tiktok_says(page, rx)` (ignore bio, nom et lignes de liste),
   jamais `visible(page.get_by_text(rx))` ; compte introuvable : `account_missing(page)`.
 - Etat d'un passage dans `cfg` (cles `_...`), remis a zero dans `cmd_run` : `_skip`, `_attempts`, `_recent`,
-  `_checked` valent pour tout le passage (une source peut etre rouverte plusieurs fois).
+  `_checked`, `_tried` valent pour tout le passage (une source peut etre rouverte plusieurs fois).
+- Reveils toutes les 20 min : tout etat qui valait "une fois par passage" doit valoir "une fois par jour"
+  quand il compte des echecs ou accorde un credit (`bump_trouble`, `seed_fail_on`, `settle_clean_day`,
+  `logged_out_on`, `unfollow_broken_on`, `session_idle`) ; journal des reveils sans action via `say()`.
 - Clic d'abonnement ignore ou refuse : `add_follow` puis `mark_unfollowed(PHANTOM, action=False)` (compte
   dans les plafonds, plus jamais clique, hors statistiques). Follow-back vu seulement au desabonnement :
   `mark_followed_back(late=True)` (colonne `fb_late`, censure dans `samples`).
